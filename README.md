@@ -83,8 +83,15 @@ sbx-copilot Assistant -- --resume
   configuration commands; failures abort the launch. Repository settings,
   explicit agent arguments, and resumed session selections may override defaults.
   These saved sandbox settings remain after uninstalling the host wrappers.
-- Copilot always receives `--no-remote`; passing `--remote` is rejected.
-  This is a per-launch option, not a rewrite of your Copilot settings.
+- Copilot receives `--sync-session=off` to disable read-only account history
+  sync for this run. The old `--remote` and `--no-remote` flags were removed
+  in Copilot 1.0.103; the wrapper rejects them with an explanation.
+  Explicit `--connect`, `--host-environment`, and `--host-ahp` options and
+  sync overrides are also rejected. Incoming connections are a separate
+  control: use `/remote off` in a session and manage registered incoming
+  environments in `/environments`. The wrapper does not unregister existing
+  environments or guarantee that incoming access is disabled.
+  Requires a Copilot version supporting `--sync-session=off`.
 - Errors stop the launch instead of silently skipping MCPs or updates.
   A sandbox created before a setup failure remains available for retry.
 - No registry, background process, host credentials, or Docker settings are
@@ -116,7 +123,7 @@ Live Docker/MCP connectivity must be checked separately with your local daemon.
 - [OpenCode V2 migration considerations](https://opencode.ai/v2/docs/migrate-v1)
 - [OpenCode free-model environment switch](https://opencode.ai/v2/docs/models#free-models)
 - [OpenCode V2 provider policies](https://opencode.ai/v2/docs/policies)
-- [Copilot --no-remote](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/steer-remotely)
+- [Copilot remote flag removal (1.0.103)](https://github.com/github/copilot-cli/blob/main/changelog.md)
 - [Copilot configuration commands](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference#using-copilot-config)
 - [Copilot Auto tier settings](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
 - [Haiku 5.5 on OpenRouter](https://openrouter.ai/anthropic/claude-haiku-5.5)

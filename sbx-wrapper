@@ -16,7 +16,7 @@ for a name and create one. With NAME, open an existing sandbox from anywhere.
 Names such as "Project A" are converted to project-a.
 
 Every launch loads the registered xcode and exa MCP servers.
-OpenCode is updated and migrated from V1 to V2; Copilot uses --no-remote.
+OpenCode is updated and migrated from V1 to V2; Copilot uses --sync-session=off.
 OpenCode hides its free models and enables only the OpenRouter provider.
 Defaults: OpenCode uses Haiku 5.5; Copilot uses Auto Balance.
 Override MCP registration names with SBX_XCODE_MCP and SBX_EXA_MCP.
@@ -52,7 +52,12 @@ fi
 if [[ $agent == copilot ]]; then
     for arg in "$@"; do
         case "$arg" in
-            --remote|--remote=*) die "Remote sessions are disabled by this wrapper." ;;
+            --remote|--remote=*|--no-remote|--no-remote=*)
+                die "Copilot removed --remote/--no-remote. Use /remote off in a session." ;;
+            --connect|--connect=*|--host-environment|--host-environment=*|--host-ahp|--host-ahp=*)
+                die "Remote connection and hosting options are disabled by this wrapper." ;;
+            --sync-session|--sync-session=*)
+                die "Session sync is disabled by this wrapper (--sync-session=off)." ;;
         esac
     done
 fi
@@ -158,5 +163,5 @@ if [[ $agent == opencode ]]; then
 else
     sbx exec "$name" copilot config --global model auto
     sbx exec "$name" copilot config --global autoTier balance
-    exec sbx run --name "$name" -- --no-remote "$@"
+    exec sbx run --name "$name" -- --sync-session=off "$@"
 fi

@@ -42,7 +42,13 @@ if (args[0] === 'exec') {
     const result = spawnSync(args[2], args.slice(3), { stdio: 'inherit' });
     process.exit(result.status ?? 1);
 }
-if (args[0] === 'run') process.exit(Number(process.env.AGENT_STATUS || 0));
+if (args[0] === 'run') {
+    if (args.includes('--no-remote')) {
+        console.error('error: --no-remote was removed');
+        process.exit(1);
+    }
+    process.exit(Number(process.env.AGENT_STATUS || 0));
+}
 `, { mode: 0o755 });
     fs.writeFileSync(path.join(bin, 'copilot'), `#!${process.execPath}
 const fs = require('node:fs');
@@ -171,7 +177,7 @@ test('prompt creates a normalized name with the physical workspace', t => {
     const result = f.run('copilot', [], 'Project A\n');
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(f.calls()[1], ['create', '--name', 'project-a', 'copilot', f.workspace]);
-    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'project-a', '--', '--no-remote']);
+    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'project-a', '--', '--sync-session=off']);
 });
 
 test('folder matching distinguishes agents and ignores mountless sandboxes', t => {
@@ -183,7 +189,7 @@ test('folder matching distinguishes agents and ignores mountless sandboxes', t =
         ],
     });
     assert.equal(f.run('copilot').status, 0);
-    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'Assistant', '--', '--no-remote']);
+    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'Assistant', '--', '--sync-session=off']);
     assert.deepEqual(f.calls().filter(c => c[0] === 'exec'), [
         ['exec', 'Assistant', 'copilot', 'config', '--global', 'model', 'auto'],
         ['exec', 'Assistant', 'copilot', 'config', '--global', 'autoTier', 'balance'],
@@ -220,7 +226,13 @@ for (const [title, options, agent, args, input, message] of [
     ['one-character name', { inventory: () => [] }, 'opencode', [], 'A\n', /at least two/],
     ['prompt EOF', { inventory: () => [] }, 'opencode', [], '', /Could not read/],
     ['unseparated arguments', {}, 'opencode', ['Project-A', '--continue'], '', /Put --/],
-    ['remote override', {}, 'copilot', ['--', '--remote'], '', /Remote sessions/],
+    ['removed remote flag', {}, 'copilot', ['--', '--remote'], '', /Copilot removed/],
+    ['removed no-remote flag', {}, 'copilot', ['--', '--no-remote'], '', /Copilot removed/],
+    ['remote connection', {}, 'copilot', ['--', '--connect=session'], '', /Remote connection/],
+    ['remote hosting', {}, 'copilot', ['--', '--host-environment', 'test'], '', /Remote connection/],
+    ['AHP hosting', {}, 'copilot', ['--', '--host-ahp'], '', /Remote connection/],
+    ['sync override', {}, 'copilot', ['--', '--sync-session=on'], '', /Session sync/],
+    ['bare sync override', {}, 'copilot', ['--', '--sync-session'], '', /Session sync/],
     ['invalid JSON schema', { inventory: () => ({ sandboxes: [] }) },
         'opencode', [], '', /Unexpected/],
     ['invalid workspace type', {

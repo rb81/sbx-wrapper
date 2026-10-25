@@ -180,6 +180,40 @@ test('prompt creates a normalized name with the physical workspace', t => {
     assert.deepEqual(f.calls().at(-1), ['run', '--name', 'project-a', '--', '--sync-session=off']);
 });
 
+test('--no-workspace prompts for a mountless sandbox even when this folder has one', t => {
+    const f = fixture(t, {
+        inventory: w => [{ name: 'folder-box', agent: 'opencode', workspaces: [w] }],
+    });
+    const result = f.run('opencode', ['--no-workspace'], 'Scratch Box\n');
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls()[1], ['create', '--name', 'scratch-box', 'opencode']);
+    assert.deepEqual(f.calls().at(-1).slice(0, 3), ['run', '--name', 'scratch-box']);
+});
+
+test('--no-workspace with a name opens an existing sandbox', t => {
+    const f = fixture(t, {
+        inventory: () => [{ name: 'project-a', agent: 'opencode' }],
+    });
+    assert.equal(f.run('opencode', ['--no-workspace', 'Project A']).status, 0);
+    assert.ok(!f.calls().some(c => c[0] === 'create'));
+    assert.equal(f.calls().at(-1)[2], 'project-a');
+});
+
+test('--no-workspace with a missing name creates a mountless sandbox with that name', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run('copilot', ['--no-workspace', 'Scratch']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls()[1], ['create', '--name', 'scratch', 'copilot']);
+    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'scratch', '--', '--sync-session=off']);
+});
+
+test('--no-workspace passes agent arguments through', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run('opencode', ['--no-workspace', 'Scratch', '--', '--continue'], '');
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(f.calls().at(-1).at(-1), '--continue');
+});
+
 test('folder matching distinguishes agents and ignores mountless sandboxes', t => {
     const f = fixture(t, {
         inventory: workspace => [

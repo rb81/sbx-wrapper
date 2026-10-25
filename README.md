@@ -43,7 +43,15 @@ sbx-opencode "Project A"     # open existing project-a from any folder
 sbx-copilot Assistant       # existing names/capitalization are preserved
 sbx-opencode -- --continue  # pass arguments to the agent, not sbx
 sbx-copilot Assistant -- --resume
+sbx-opencode --no-workspace  # new sandbox with no host folder attached
+sbx-opencode --no-workspace Scratch  # open or create "Scratch" without a folder
 ```
+
+- `--no-workspace` skips folder lookup and creates a mountless sandbox
+  (`sbx create --name NAME AGENT`, with no workspace path). It prompts for a
+  name when none is given. The agent starts in the template's working
+  directory, and files there are deleted when the sandbox is removed. Use
+  `sbx cp` to move files in or out.
 
 - Folder lookup uses the physical current directory and the agent type against
   `sbx ls --json`'s `workspaces` array. It does not search parent folders.

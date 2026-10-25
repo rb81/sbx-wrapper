@@ -8,12 +8,16 @@ die() {
 
 usage() {
     cat <<'EOF'
-Usage: sbx-opencode [NAME] [-- AGENT_ARGS...]
-       sbx-copilot  [NAME] [-- AGENT_ARGS...]
+Usage: sbx-opencode [--no-workspace] [NAME] [-- AGENT_ARGS...]
+       sbx-copilot  [--no-workspace] [NAME] [-- AGENT_ARGS...]
 
 Without NAME, reuse this folder's sandbox for the selected agent, or prompt
 for a name and create one. With NAME, open an existing sandbox from anywhere.
 Names such as "Project A" are converted to project-a.
+
+--no-workspace skips folder lookup and creates a mountless sandbox with no
+host folder attached. Without NAME, it prompts for a name; with NAME, it opens
+that sandbox or creates it if it does not exist.
 
 Every launch loads the registered xcode and exa MCP servers.
 OpenCode is updated and migrated from V1 to V2; Copilot uses --sync-session=off.
@@ -35,6 +39,11 @@ case "${0##*/}" in
         ;;
 esac
 
+no_workspace=
+while [[ ${1:-} == --no-workspace ]]; do
+    no_workspace=1
+    shift
+done
 requested=
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
@@ -91,14 +100,17 @@ if [[ -n $requested ]]; then
         matches=$(jq --arg name "$normalized" \
             '[.[] | select((.name | ascii_downcase) == $name)]' <<<"$inventory")
     fi
-    [[ $(jq length <<<"$matches") != 0 ]] ||
-        die "No sandbox named '$requested'. To create one, run without a name in its folder."
-else
+    if [[ $(jq length <<<"$matches") == 0 && -z $no_workspace ]]; then
+        die "No sandbox named '$requested'. To create one, run without a name in its folder, or add --no-workspace."
+    fi
+elif [[ -z $no_workspace ]]; then
     workspace=$(pwd -P)
     matches=$(jq --arg agent "$agent" --arg workspace "$workspace" '
         [.[] | select(.agent == $agent and
             ((.workspaces // []) | index($workspace) != null))]
     ' <<<"$inventory")
+else
+    matches='[]'
 fi
 
 count=$(jq length <<<"$matches")
@@ -112,8 +124,15 @@ elif [[ $count == 1 ]]; then
     [[ $existing_agent == "$agent" ]] ||
         die "'$name' uses $existing_agent, not $agent. Use the matching wrapper."
 else
-    printf 'Sandbox name for %s (%s): ' "$workspace" "$agent" >&2
-    IFS= read -r label || die "Could not read a sandbox name."
+    if [[ -n $requested ]]; then
+        label=$requested
+    elif [[ -n $no_workspace ]]; then
+        printf 'Sandbox name for a mountless %s sandbox: ' "$agent" >&2
+        IFS= read -r label || die "Could not read a sandbox name."
+    else
+        printf 'Sandbox name for %s (%s): ' "$workspace" "$agent" >&2
+        IFS= read -r label || die "Could not read a sandbox name."
+    fi
     name=$(normalize_name "$label")
     [[ $name =~ ^[a-z0-9][a-z0-9.-]+$ && $name != default ]] ||
         die "Use at least two characters (letters/numbers); 'default' is reserved."
@@ -122,7 +141,11 @@ else
         die "Name '$name' is already taken. Open it explicitly or choose another name."
     fi
     printf 'Creating %s\n' "$name" >&2
-    sbx create --name "$name" "$agent" "$workspace"
+    if [[ -n $no_workspace ]]; then
+        sbx create --name "$name" "$agent"
+    else
+        sbx create --name "$name" "$agent" "$workspace"
+    fi
 fi
 
 sbx mcp load "${SBX_XCODE_MCP:-xcode}" --sandbox "$name"

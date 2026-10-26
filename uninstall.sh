@@ -7,5 +7,5 @@ if [[ $# -gt 1 || ( $# -eq 1 && -z $1 ) ]]; then
 fi
 
 destination=${1:-"$HOME/.local/bin"}
-rm -f -- "$destination/sbx-opencode" "$destination/sbx-copilot"
-printf 'Removed sbx-opencode and sbx-copilot from %s\n' "$destination"
+rm -f -- "$destination/sbxw" "$destination/sbx-opencode" "$destination/sbx-copilot"
+printf 'Removed sbxw from %s\n' "$destination"

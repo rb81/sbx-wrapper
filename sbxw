@@ -1,0 +1,305 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+die() {
+    printf 'sbxw: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: sbxw ls
+       sbxw opencode [NAME] [--no-folder] [-- AGENT_ARGS...]
+       sbxw copilot  [NAME] [--no-folder] [-- AGENT_ARGS...]
+       sbxw -h | --help
+
+Commands:
+  ls          List all sandboxes in a menu. Up/Down (or k/j) moves, Enter opens
+              the highlighted sandbox, q or Esc cancels. Without an interactive
+              terminal, prints the list and exits.
+  opencode    Open or create an OpenCode sandbox.
+  copilot     Open or create a Copilot sandbox.
+
+Options for opencode and copilot:
+  NAME        Sandbox to open, or to create if it does not exist. "Project A"
+              becomes project-a. Names are unique across agents. If NAME is
+              omitted, you are prompted, and the prompt suggests the current
+              folder's name. A name that already exists is rejected at the
+              prompt, so give an existing sandbox's name to reopen it.
+  --no-folder Create the sandbox without a host folder. Its files are deleted
+              when the sandbox is removed; use sbx cp to move files in or out.
+  -- ARGS     Pass ARGS to the agent, for example -- --continue for OpenCode
+              or -- --resume for Copilot (resume the last Copilot conversation).
+  -h, --help  Show this help.
+
+An existing sandbox always opens as it is, regardless of the current folder.
+The current folder is used only when creating a sandbox, unless --no-folder
+is given.
+
+Every launch loads the xcode and exa MCP servers with sbx mcp load.
+Names of those registrations can be changed with SBX_XCODE_MCP and SBX_EXA_MCP.
+OpenCode is updated and migrated from V1 to V2. It hides free models and
+enables only the OpenRouter provider. Its default model is Claude Haiku 5.5.
+Copilot runs with --sync-session=off and saves Auto Balance as its default.
+EOF
+}
+
+normalize_name() {
+    LC_ALL=C printf '%s' "$1" |
+        LC_ALL=C tr '[:upper:]' '[:lower:]' |
+        LC_ALL=C sed -E 's/[^a-z0-9.-]+/-/g; s/^[.-]+//; s/-+$//'
+}
+
+valid_name() {
+    [[ $1 =~ ^[a-z0-9][a-z0-9.-]+$ && $1 != default ]]
+}
+
+is_taken() {
+    jq -e --arg name "$1" 'any(.[]; (.name | ascii_downcase) == $name)' \
+        <<<"$inventory" >/dev/null
+}
+
+find_sandbox() {
+    local normalized
+    found=$(jq -r --arg name "$1" \
+        'first(.[] | select(.name == $name) | .name) // empty' <<<"$inventory")
+    if [[ -z $found ]]; then
+        normalized=$(normalize_name "$1")
+        found=$(jq -r --arg name "$normalized" \
+            'first(.[] | select((.name | ascii_downcase) == $name) | .name) // empty' \
+            <<<"$inventory")
+    fi
+}
+
+prompt_for_name() {
+    local default= label
+    if [[ -z $no_folder ]]; then
+        default=$(normalize_name "$(basename -- "$workspace")")
+        valid_name "$default" || default=
+    fi
+    while :; do
+        if [[ -n $default ]]; then
+            printf 'Sandbox name [%s]: ' "$default" >&2
+        else
+            printf 'Sandbox name: ' >&2
+        fi
+        IFS= read -r label || die "Could not read a sandbox name."
+        [[ -n $label ]] || label=$default
+        name=$(normalize_name "$label")
+        if ! valid_name "$name"; then
+            printf 'Use at least two letters or numbers; "default" is reserved.\n' >&2
+        elif is_taken "$name"; then
+            printf "Name '%s' is already taken. Choose another name.\n" "$name" >&2
+        else
+            return 0
+        fi
+    done
+}
+
+create_sandbox() {
+    printf 'Creating %s\n' "$name" >&2
+    if [[ -n $no_folder ]]; then
+        sbx create --name "$name" "$agent"
+    else
+        sbx create --name "$name" "$agent" "$workspace"
+    fi
+}
+
+choose_sandbox() {
+    local count=${#names[@]} index=0 lines=$((${#names[@]} + 2)) drawn= i key rest
+    printf '\033[?25l' >&2
+    while :; do
+        [[ -z $drawn ]] || printf '\033[%dA' "$lines" >&2
+        drawn=1
+        printf '\033[2K Up/Down move, Enter opens, q cancels\n' >&2
+        printf '\033[2K   %-24s %-10s %s\n' NAME AGENT FOLDER >&2
+        for ((i = 0; i < count; i++)); do
+            if ((i == index)); then
+                printf '\033[2K\033[7m > %-24s %-10s %s \033[0m\n' \
+                    "${names[i]}" "${agents[i]}" "${folders[i]}" >&2
+            else
+                printf '\033[2K   %-24s %-10s %s\n' \
+                    "${names[i]}" "${agents[i]}" "${folders[i]}" >&2
+            fi
+        done
+        key=
+        IFS= read -rsn1 key || key=q
+        case $key in
+            $'\033')
+                rest=
+                IFS= read -rsn2 -t 1 rest || true
+                case $rest in
+                    '[A'|'OA') index=$(((index + count - 1) % count)) ;;
+                    '[B'|'OB') index=$(((index + 1) % count)) ;;
+                    *) printf '\033[?25h' >&2; return 1 ;;
+                esac
+                ;;
+            k) index=$(((index + count - 1) % count)) ;;
+            j) index=$(((index + 1) % count)) ;;
+            '') chosen=$index; printf '\033[?25h' >&2; return 0 ;;
+            q|Q) printf '\033[?25h' >&2; return 1 ;;
+        esac
+    done
+}
+
+launch_sandbox() {
+    local agent=$1 name=$2
+    shift 2
+    [[ $agent == opencode || $agent == copilot ]] ||
+        die "'$name' uses $agent, which sbxw does not support."
+    sbx mcp load "${SBX_XCODE_MCP:-xcode}" --sandbox "$name"
+    sbx mcp load "${SBX_EXA_MCP:-exa}" --sandbox "$name"
+
+    if [[ $agent == opencode ]]; then
+        printf 'Updating OpenCode in %s...\n' "$name" >&2
+        sbx exec "$name" bash -c '
+            set -euo pipefail
+            major_version() {
+                local version
+                version=$(opencode --version)
+                if [[ $version =~ (^|[[:space:]])v?([0-9]+)\. ]]; then
+                    printf "%s\n" "${BASH_REMATCH[2]}"
+                else
+                    printf "Cannot parse OpenCode version: %s\n" "$version" >&2
+                    return 1
+                fi
+            }
+            opencode upgrade
+            hash -r
+            major=$(major_version)
+            if [[ $major == 1 ]]; then
+                opencode upgrade --major
+                hash -r
+            fi
+            major=$(major_version)
+            if [[ $major -lt 2 ]]; then
+                printf "OpenCode migration did not install V2; launch aborted.\n" >&2
+                exit 1
+            fi
+            opencode --version
+        '
+        provider_config='{"model":"openrouter/anthropic/claude-haiku-5.5","policies":[{"action":"provider.use","resource":"*","effect":"deny"},{"action":"provider.use","resource":"openrouter","effect":"allow"}]}'
+        exec sbx run --name "$name" \
+            -e OPENCODE_DISABLE_FREE_MODELS=1 \
+            -e "OPENCODE_CONFIG_CONTENT=$provider_config" -- "$@"
+    else
+        sbx exec "$name" copilot config --global model auto
+        sbx exec "$name" copilot config --global autoTier balance
+        exec sbx run --name "$name" -- --sync-session=off "$@"
+    fi
+}
+
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+subcommand=
+agent=
+case $1 in
+    -h|--help) usage; exit 0 ;;
+    ls) subcommand=ls; shift ;;
+    opencode|copilot) subcommand=launch; agent=$1; shift ;;
+    *) die "Unknown command: $1. Run sbxw --help." ;;
+esac
+
+name=
+no_folder=
+if [[ $subcommand == ls ]]; then
+    if [[ ${1:-} == -h || ${1:-} == --help ]]; then usage; exit 0; fi
+    [[ $# -eq 0 ]] || die "ls takes no arguments. Run sbxw --help."
+else
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --no-folder) no_folder=1; shift ;;
+            --) shift; break ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "Unknown option: $1. Run sbxw --help." ;;
+            *)
+                [[ -n $1 ]] || die "Sandbox name cannot be empty."
+                [[ -z $name ]] || die "Only one sandbox name is allowed. Put agent arguments after --."
+                name=$1
+                shift
+                ;;
+        esac
+    done
+fi
+if [[ $subcommand == launch && $agent == copilot ]]; then
+    for arg in "$@"; do
+        case "$arg" in
+            --remote|--remote=*|--no-remote|--no-remote=*)
+                die "Copilot removed --remote/--no-remote. Use /remote off in a session." ;;
+            --connect|--connect=*|--host-environment|--host-environment=*|--host-ahp|--host-ahp=*)
+                die "Remote connection and hosting options are disabled by this wrapper." ;;
+            --sync-session|--sync-session=*)
+                die "Session sync is disabled by this wrapper (--sync-session=off)." ;;
+        esac
+    done
+fi
+
+trap 'printf "sbxw: command failed at line %s (exit %s); launch aborted.\n" "$LINENO" "$?" >&2' ERR
+for dependency in sbx jq; do
+    command -v "$dependency" >/dev/null 2>&1 || die "Required command not found: $dependency"
+done
+
+inventory=$(sbx ls --json)
+if ! jq -e '
+    type == "array" and all(.[];
+        (.name | type == "string") and
+        (.agent | type == "string") and
+        ((.workspaces // []) | type == "array" and all(.[]; type == "string"))
+    )
+' <<<"$inventory" >/dev/null; then
+    die "Unexpected sbx ls --json format; expected the sbx 0.48+ sandbox array."
+fi
+workspace=$(pwd -P)
+
+if [[ $subcommand == ls ]]; then
+    names=()
+    agents=()
+    folders=()
+    while IFS=$'\t' read -r sandbox_name sandbox_agent sandbox_folders; do
+        if ((${#sandbox_folders} > 50)); then
+            sandbox_folders="...${sandbox_folders: -47}"
+        fi
+        names+=("$sandbox_name")
+        agents+=("$sandbox_agent")
+        folders+=("$sandbox_folders")
+    done < <(jq -r '.[] | [.name, .agent, ((.workspaces // []) | if length == 0 then "(no folder)" else join(", ") end)] | @tsv' <<<"$inventory")
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        printf 'No sandboxes yet. Create one with: sbxw opencode NAME\n'
+        exit 0
+    fi
+    if [[ ! -t 0 || ! -t 2 ]]; then
+        printf '%-24s %-10s %s\n' NAME AGENT FOLDER
+        for ((i = 0; i < ${#names[@]}; i++)); do
+            printf '%-24s %-10s %s\n' "${names[i]}" "${agents[i]}" "${folders[i]}"
+        done
+        exit 0
+    fi
+
+    trap 'printf "\033[?25h" >&2; exit 130' INT
+    if ! choose_sandbox; then
+        trap - INT
+        printf 'Cancelled.\n' >&2
+        exit 0
+    fi
+    trap - INT
+    agent=${agents[chosen]}
+    name=${names[chosen]}
+elif [[ -n $name ]]; then
+    find_sandbox "$name"
+    if [[ -n $found ]]; then
+        name=$found
+        existing_agent=$(jq -r --arg name "$name" \
+            'first(.[] | select(.name == $name) | .agent)' <<<"$inventory")
+        [[ $existing_agent == "$agent" ]] ||
+            die "'$name' uses $existing_agent, not $agent. Run: sbxw $existing_agent $name"
+    else
+        name=$(normalize_name "$name")
+        valid_name "$name" || die "Use at least two letters or numbers; 'default' is reserved."
+        create_sandbox
+    fi
+else
+    prompt_for_name
+    create_sandbox
+fi
+
+launch_sandbox "$agent" "$name" "$@"

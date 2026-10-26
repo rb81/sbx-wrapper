@@ -5,6 +5,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
+const script = path.join(root, 'sbxw');
 const openRouterPolicies = [
     { action: 'provider.use', resource: '*', effect: 'deny' },
     { action: 'provider.use', resource: 'openrouter', effect: 'allow' },
@@ -16,7 +17,7 @@ const openCodeConfig = {
 
 function fixture(t, options = {}) {
     assert.ok(process.env.TMPDIR, 'TMPDIR must be set');
-    const dir = fs.mkdtempSync(path.join(process.env.TMPDIR, 'sbx-wrapper-test-'));
+    const dir = fs.mkdtempSync(path.join(process.env.TMPDIR, 'sbxw-test-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const bin = path.join(dir, 'bin');
     let workspace = path.join(dir, 'Project Folder');
@@ -106,8 +107,8 @@ if (args[0] === '--version') {
         : [];
     return {
         dir, bin, workspace, env, copilotSettings,
-        run(agent = 'opencode', args = [], input = '') {
-            return spawnSync('/bin/bash', [path.join(root, 'sbx-wrapper'), agent, ...args], {
+        run(args = [], input = '') {
+            return spawnSync('/bin/bash', [script, ...args], {
                 cwd: workspace, env, input, encoding: 'utf8',
             });
         },
@@ -116,9 +117,9 @@ if (args[0] === '--version') {
     };
 }
 
-test('folder reuse, runtime MCPs, V1 update then major migration, agent arguments', t => {
+test('opening an existing sandbox reuses it, runs MCP loads and update, passes agent arguments', t => {
     const f = fixture(t);
-    const result = f.run('opencode', ['--', '--continue', 'argument with spaces']);
+    const result = f.run(['opencode', 'Project-A', '--', '--continue', 'argument with spaces']);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(f.calls().map(c => c[0]), ['ls', 'mcp', 'mcp', 'exec', 'run']);
     assert.deepEqual(f.calls()[1], ['mcp', 'load', 'xcode', '--sandbox', 'Project-A']);
@@ -133,8 +134,8 @@ test('folder reuse, runtime MCPs, V1 update then major migration, agent argument
 
 test('every OpenCode launch passes free-model disabling and an OpenRouter-only policy', t => {
     const f = fixture(t, { version: 'opencode v2.1.3' });
-    for (const args of [[], ['Project-A']]) {
-        const result = f.run('opencode', args);
+    for (const args of [['Project-A'], ['Project-A', '--', '--continue']]) {
+        const result = f.run(['opencode', ...args]);
         assert.equal(result.status, 0, result.stderr);
         const run = f.calls().at(-1);
         const separator = run.indexOf('--');
@@ -158,72 +159,88 @@ test('every OpenCode launch passes free-model disabling and an OpenRouter-only p
 
 test('V2 updates without repeating the major migration', t => {
     const f = fixture(t, { version: 'opencode v2.1.3' });
-    const result = f.run();
+    const result = f.run(['opencode', 'Project-A']);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(f.upgrades(), [['upgrade']]);
 });
 
-test('named lookup works from another folder and normalizes a display name', t => {
+test('an existing sandbox opens from any folder, ignoring the current folder', t => {
     const f = fixture(t, {
         inventory: () => [{ name: 'project-a', agent: 'opencode', workspaces: ['/elsewhere'] }],
     });
-    assert.equal(f.run('opencode', ['Project A']).status, 0);
+    assert.equal(f.run(['opencode', 'Project A']).status, 0);
     assert.equal(f.calls().at(-1)[2], 'project-a');
     assert.ok(!f.calls().some(c => c[0] === 'create'));
 });
 
-test('prompt creates a normalized name with the physical workspace', t => {
+test('a new name is normalized and attached to the current folder', t => {
     const f = fixture(t, { inventory: () => [] });
-    const result = f.run('copilot', [], 'Project A\n');
+    const result = f.run(['copilot', 'Project A']);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(f.calls()[1], ['create', '--name', 'project-a', 'copilot', f.workspace]);
     assert.deepEqual(f.calls().at(-1), ['run', '--name', 'project-a', '--', '--sync-session=off']);
 });
 
-test('--no-workspace prompts for a mountless sandbox even when this folder has one', t => {
-    const f = fixture(t, {
-        inventory: w => [{ name: 'folder-box', agent: 'opencode', workspaces: [w] }],
-    });
-    const result = f.run('opencode', ['--no-workspace'], 'Scratch Box\n');
+test('--no-folder creates a sandbox without a host folder', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run(['opencode', 'scratch', '--no-folder']);
     assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls()[1], ['create', '--name', 'scratch', 'opencode']);
+});
+
+test('--no-folder is accepted after the agent arguments separator only as an argument', t => {
+    const f = fixture(t, { inventory: () => [{ name: 'scratch', agent: 'copilot' }] });
+    const result = f.run(['copilot', 'scratch', '--', '--no-folder']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(f.calls().at(-1).at(-1), '--no-folder');
+});
+
+test('without a name, the prompt suggests the folder name and accepts Enter', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run(['opencode'], '\n');
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /Sandbox name \[project-folder\]: /);
+    assert.deepEqual(f.calls()[1], ['create', '--name', 'project-folder', 'opencode', f.workspace]);
+});
+
+test('without a name, a typed name is normalized', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run(['copilot'], 'Scratch Box\n');
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls()[1], ['create', '--name', 'scratch-box', 'copilot', f.workspace]);
+});
+
+test('a duplicate name at the prompt is rejected and asked again', t => {
+    const f = fixture(t, {
+        inventory: () => [{ name: 'taken', agent: 'copilot' }],
+    });
+    const result = f.run(['opencode'], 'Taken\nFresh\n');
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /Name 'taken' is already taken/);
+    assert.deepEqual(f.calls()[1], ['create', '--name', 'fresh', 'opencode', f.workspace]);
+});
+
+test('--no-folder without a name prompts with no folder default', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run(['opencode', '--no-folder'], 'Scratch Box\n');
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /Sandbox name: /);
     assert.deepEqual(f.calls()[1], ['create', '--name', 'scratch-box', 'opencode']);
-    assert.deepEqual(f.calls().at(-1).slice(0, 3), ['run', '--name', 'scratch-box']);
 });
 
-test('--no-workspace with a name opens an existing sandbox', t => {
-    const f = fixture(t, {
-        inventory: () => [{ name: 'project-a', agent: 'opencode' }],
-    });
-    assert.equal(f.run('opencode', ['--no-workspace', 'Project A']).status, 0);
-    assert.ok(!f.calls().some(c => c[0] === 'create'));
-    assert.equal(f.calls().at(-1)[2], 'project-a');
-});
-
-test('--no-workspace with a missing name creates a mountless sandbox with that name', t => {
-    const f = fixture(t, { inventory: () => [] });
-    const result = f.run('copilot', ['--no-workspace', 'Scratch']);
+test('copilot agent arguments pass after --', t => {
+    const f = fixture(t, { inventory: () => [{ name: 'assistant', agent: 'copilot' }] });
+    const result = f.run(['copilot', 'assistant', '--', '--resume']);
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(f.calls()[1], ['create', '--name', 'scratch', 'copilot']);
-    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'scratch', '--', '--sync-session=off']);
+    assert.deepEqual(f.calls().at(-1),
+        ['run', '--name', 'assistant', '--', '--sync-session=off', '--resume']);
 });
 
-test('--no-workspace passes agent arguments through', t => {
-    const f = fixture(t, { inventory: () => [] });
-    const result = f.run('opencode', ['--no-workspace', 'Scratch', '--', '--continue'], '');
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(f.calls().at(-1).at(-1), '--continue');
-});
-
-test('folder matching distinguishes agents and ignores mountless sandboxes', t => {
+test('copilot folder-based inventory still configures Copilot before launch', t => {
     const f = fixture(t, {
-        inventory: workspace => [
-            { name: 'other', agent: 'opencode', workspaces: [workspace] },
-            { name: 'mountless', agent: 'copilot' },
-            { name: 'Assistant', agent: 'copilot', workspaces: ['/other', workspace] },
-        ],
+        inventory: w => [{ name: 'Assistant', agent: 'copilot', workspaces: [w] }],
     });
-    assert.equal(f.run('copilot').status, 0);
-    assert.deepEqual(f.calls().at(-1), ['run', '--name', 'Assistant', '--', '--sync-session=off']);
+    assert.equal(f.run(['copilot', 'Assistant']).status, 0);
     assert.deepEqual(f.calls().filter(c => c[0] === 'exec'), [
         ['exec', 'Assistant', 'copilot', 'config', '--global', 'model', 'auto'],
         ['exec', 'Assistant', 'copilot', 'config', '--global', 'autoTier', 'balance'],
@@ -239,90 +256,133 @@ for (const key of ['model', 'autoTier']) {
             inventory: w => [{ name: 'cp', agent: 'copilot', workspaces: [w] }],
             env: { FAIL_CONFIG_KEY: key },
         });
-        const result = f.run('copilot');
+        const result = f.run(['copilot', 'cp']);
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, /mock Copilot config failure/);
         assert.ok(!f.calls().some(c => c[0] === 'run'));
     });
 }
 
-for (const [title, options, agent, args, input, message] of [
-    ['unknown explicit name', {}, 'opencode', ['missing'], '', /No sandbox named/],
-    ['wrong agent', {}, 'copilot', ['Project-A'], '', /not copilot/],
-    ['duplicate folder matches', {
-        inventory: w => ['one', 'two'].map(name => ({ name, agent: 'opencode', workspaces: [w] })),
-    }, 'opencode', [], '', /Multiple matches/],
-    ['normalized name collision', {
+for (const [title, options, args, input, message] of [
+    ['sandbox of another agent', {}, ['copilot', 'Project-A'], '', /uses opencode, not copilot/],
+    ['normalized name collision with another agent', {
         inventory: () => [{ name: 'project-a', agent: 'copilot' }],
-    }, 'opencode', [], 'Project A\n', /already taken/],
-    ['empty prompt', { inventory: () => [] }, 'opencode', [], '\n', /at least two/],
-    ['reserved name', { inventory: () => [] }, 'opencode', [], 'default\n', /reserved/],
-    ['one-character name', { inventory: () => [] }, 'opencode', [], 'A\n', /at least two/],
-    ['prompt EOF', { inventory: () => [] }, 'opencode', [], '', /Could not read/],
-    ['unseparated arguments', {}, 'opencode', ['Project-A', '--continue'], '', /Put --/],
-    ['removed remote flag', {}, 'copilot', ['--', '--remote'], '', /Copilot removed/],
-    ['removed no-remote flag', {}, 'copilot', ['--', '--no-remote'], '', /Copilot removed/],
-    ['remote connection', {}, 'copilot', ['--', '--connect=session'], '', /Remote connection/],
-    ['remote hosting', {}, 'copilot', ['--', '--host-environment', 'test'], '', /Remote connection/],
-    ['AHP hosting', {}, 'copilot', ['--', '--host-ahp'], '', /Remote connection/],
-    ['sync override', {}, 'copilot', ['--', '--sync-session=on'], '', /Session sync/],
-    ['bare sync override', {}, 'copilot', ['--', '--sync-session'], '', /Session sync/],
+    }, ['opencode', 'Project A'], '', /uses copilot, not opencode/],
+    ['prompt name that is too short', { inventory: () => [] }, ['opencode'], 'A\n', /at least two/],
+    ['prompt reserved name', { inventory: () => [] }, ['opencode'], 'default\n', /reserved/],
+    ['prompt EOF', { inventory: () => [] }, ['opencode'], '', /Could not read/],
+    ['prompt EOF after duplicate', {
+        inventory: () => [{ name: 'project-a', agent: 'copilot' }],
+    }, ['opencode'], 'Project A\n', /Could not read/],
+    ['explicit name too short', { inventory: () => [] }, ['opencode', 'A'], '', /at least two/],
+    ['unseparated agent argument', {}, ['opencode', 'Project-A', '--continue'], '', /Unknown option/],
+    ['two names', {}, ['opencode', 'Project-A', 'Other'], '', /Only one sandbox name/],
+    ['empty name', {}, ['opencode', ''], '', /cannot be empty/],
+    ['unknown option', {}, ['opencode', '--bogus'], '', /Unknown option/],
+    ['unknown command', {}, ['bogus'], '', /Unknown command/],
+    ['ls with arguments', {}, ['ls', 'extra'], '', /takes no arguments/],
+    ['removed remote flag', {}, ['copilot', 'Project-A', '--', '--remote'], '', /Copilot removed/],
+    ['removed no-remote flag', {}, ['copilot', 'Project-A', '--', '--no-remote'], '', /Copilot removed/],
+    ['remote connection', {}, ['copilot', 'Project-A', '--', '--connect=session'], '', /Remote connection/],
+    ['remote hosting', {}, ['copilot', 'Project-A', '--', '--host-environment', 'test'], '', /Remote connection/],
+    ['AHP hosting', {}, ['copilot', 'Project-A', '--', '--host-ahp'], '', /Remote connection/],
+    ['sync override', {}, ['copilot', 'Project-A', '--', '--sync-session=on'], '', /Session sync/],
+    ['bare sync override', {}, ['copilot', 'Project-A', '--', '--sync-session'], '', /Session sync/],
     ['invalid JSON schema', { inventory: () => ({ sandboxes: [] }) },
-        'opencode', [], '', /Unexpected/],
+        ['opencode', 'Project-A'], '', /Unexpected/],
     ['invalid workspace type', {
         inventory: () => [{ name: 'bad', agent: 'opencode', workspaces: [{}] }],
-    }, 'opencode', [], '', /Unexpected/],
-    ['inventory error', { env: { FAIL_COMMAND: 'ls' } }, 'opencode', [], '', /mock sbx failure/],
-    ['MCP error', { env: { FAIL_MCP: 'exa' } }, 'opencode', [], '', /mock sbx failure/],
+    }, ['opencode', 'bad'], '', /Unexpected/],
+    ['inventory error', { env: { FAIL_COMMAND: 'ls' } }, ['opencode', 'Project-A'], '', /mock sbx failure/],
+    ['MCP error', { env: { FAIL_MCP: 'exa' } }, ['opencode', 'Project-A'], '', /mock sbx failure/],
     ['creation error', { inventory: () => [], env: { FAIL_COMMAND: 'create' } },
-        'copilot', [], 'Project A\n', /mock sbx failure/],
-    ['upgrade error', { env: { FAIL_UPGRADE: '1' } }, 'opencode', [], '', /launch aborted/],
-    ['migration stays on V1', { env: { STUCK_V1: '1' } }, 'opencode', [], '', /did not install V2/],
-    ['unparseable version', { version: 'unknown' }, 'opencode', [], '', /Cannot parse/],
+        ['copilot', 'Project A'], '', /mock sbx failure/],
+    ['upgrade error', { env: { FAIL_UPGRADE: '1' } }, ['opencode', 'Project-A'], '', /launch aborted/],
+    ['migration stays on V1', { env: { STUCK_V1: '1' } }, ['opencode', 'Project-A'], '', /did not install V2/],
+    ['unparseable version', { version: 'unknown' }, ['opencode', 'Project-A'], '', /Cannot parse/],
 ]) {
     test(`fails safely: ${title}`, t => {
         const f = fixture(t, options);
-        const result = f.run(agent, args, input);
+        const result = f.run(args, input);
         assert.notEqual(result.status, 0);
         assert.match(result.stderr, message);
         assert.ok(!f.calls().some(c => c[0] === 'run'));
     });
 }
 
+test('no arguments prints usage and fails', t => {
+    const f = fixture(t);
+    const result = f.run([]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /Usage: sbxw ls/);
+});
+
+for (const args of [['--help'], ['-h'], ['opencode', '--help'], ['ls', '--help']]) {
+    test(`help is complete: ${args.join(' ')}`, t => {
+        const f = fixture(t);
+        const result = f.run(args);
+        assert.equal(result.status, 0, result.stderr);
+        for (const word of ['ls', 'opencode', 'copilot', '--no-folder', '--', '--resume', '--continue', 'SBX_XCODE_MCP']) {
+            assert.match(result.stdout, new RegExp(word.replace(/[-]/g, '\\$&')));
+        }
+    });
+}
+
+test('ls without a terminal prints the sandbox list and launches nothing', t => {
+    const f = fixture(t, {
+        inventory: () => [
+            { name: 'alpha', agent: 'opencode', workspaces: ['/one'] },
+            { name: 'beta', agent: 'copilot' },
+        ],
+    });
+    const result = f.run(['ls']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /alpha\s+opencode\s+\/one/);
+    assert.match(result.stdout, /beta\s+copilot\s+\(no folder\)/);
+    assert.ok(!f.calls().some(c => ['run', 'create', 'exec'].includes(c[0])));
+});
+
+test('ls with no sandboxes says how to create one', t => {
+    const f = fixture(t, { inventory: () => [] });
+    const result = f.run(['ls']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /No sandboxes yet/);
+});
+
 test('agent exit status propagates', t => {
     const f = fixture(t, { env: { AGENT_STATUS: '23' } });
-    assert.equal(f.run().status, 23);
+    assert.equal(f.run(['opencode', 'Project-A']).status, 23);
 });
 
 test('custom MCP registration names', t => {
     const f = fixture(t, { env: { SBX_XCODE_MCP: 'my-xcode', SBX_EXA_MCP: 'my-exa' } });
-    assert.equal(f.run().status, 0);
+    assert.equal(f.run(['opencode', 'Project-A']).status, 0);
     assert.equal(f.calls()[1][2], 'my-xcode');
     assert.equal(f.calls()[2][2], 'my-exa');
 });
 
-test('installer produces both directly executable commands, including paths with spaces', t => {
+test('installer produces one executable sbxw and removes the old commands', t => {
     const f = fixture(t, {
-        inventory: w => [
-            { name: 'oc', agent: 'opencode', workspaces: [w] },
-            { name: 'cp', agent: 'copilot', workspaces: [w] },
-        ],
+        inventory: w => [{ name: 'oc', agent: 'opencode', workspaces: [w] }],
     });
     const destination = path.join(f.dir, 'Installed Commands');
+    fs.mkdirSync(destination);
+    fs.writeFileSync(path.join(destination, 'sbx-opencode'), 'old');
+    fs.writeFileSync(path.join(destination, 'sbx-copilot'), 'old');
     const installed = spawnSync('/bin/bash', [path.join(root, 'install.sh'), destination], {
         encoding: 'utf8', env: f.env,
     });
     assert.equal(installed.status, 0, installed.stderr);
-    for (const command of ['sbx-opencode', 'sbx-copilot']) {
-        const result = spawnSync(path.join(destination, command), [], {
-            cwd: f.workspace, env: f.env, encoding: 'utf8',
-        });
-        assert.equal(result.status, 0, result.stderr);
-    }
+    assert.ok(!fs.existsSync(path.join(destination, 'sbx-opencode')));
+    assert.ok(!fs.existsSync(path.join(destination, 'sbx-copilot')));
+    const result = spawnSync(path.join(destination, 'sbxw'), ['opencode', 'oc'], {
+        cwd: f.workspace, env: f.env, encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
 });
 
 for (const custom of [false, true]) {
-    test(`uninstaller removes only wrapper commands (${custom ? 'custom' : 'default'} directory)`, t => {
+    test(`uninstaller removes only sbxw and old commands (${custom ? 'custom' : 'default'} directory)`, t => {
         const f = fixture(t);
         const home = path.join(f.dir, 'Test Home');
         const destination = custom
@@ -340,8 +400,7 @@ for (const custom of [false, true]) {
                 path.join(root, 'uninstall.sh'), ...(custom ? [destination] : []),
             ], { env, encoding: 'utf8' });
             assert.equal(result.status, 0, result.stderr);
-            assert.ok(!fs.existsSync(path.join(destination, 'sbx-opencode')));
-            assert.ok(!fs.existsSync(path.join(destination, 'sbx-copilot')));
+            assert.ok(!fs.existsSync(path.join(destination, 'sbxw')));
             assert.equal(fs.readFileSync(unrelated, 'utf8'), 'keep');
         }
     });
@@ -360,7 +419,7 @@ test('uninstaller accepts a missing directory without creating it', t => {
 test('uninstaller rejects invalid arguments and does not recursively remove directories', t => {
     const f = fixture(t);
     const destination = path.join(f.dir, 'Installed Commands');
-    const protectedDirectory = path.join(destination, 'sbx-opencode');
+    const protectedDirectory = path.join(destination, 'sbxw');
     fs.mkdirSync(protectedDirectory, { recursive: true });
     const file = path.join(protectedDirectory, 'keep');
     fs.writeFileSync(file, 'keep');

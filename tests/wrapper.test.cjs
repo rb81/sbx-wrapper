@@ -40,7 +40,10 @@ if (args[0] === process.env.FAIL_COMMAND ||
 }
 if (args[0] === 'ls') process.stdout.write(process.env.INVENTORY);
 if (args[0] === 'exec') {
-    const result = spawnSync(args[2], args.slice(3), { stdio: 'inherit' });
+    let rest = args.slice(1);
+    if (rest[0] === '-u') rest = rest.slice(2);
+    const commandArgs = rest.slice(2).map(a => a.split('/etc/sbxw').join(process.env.ETC_DIR));
+    const result = spawnSync(rest[1], commandArgs, { stdio: 'inherit' });
     process.exit(result.status ?? 1);
 }
 if (args[0] === 'run') {
@@ -65,6 +68,7 @@ const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
 settings[args[2]] = args[3];
 fs.writeFileSync(file, JSON.stringify(settings));
 `, { mode: 0o755 });
+    const etcDir = path.join(dir, 'etc-sbxw');
     const copilotSettings = path.join(dir, 'copilot-settings.json');
     fs.writeFileSync(copilotSettings, JSON.stringify({
         model: 'old-model', autoTier: 'intelligence', theme: 'keep',
@@ -84,8 +88,15 @@ if (args[0] === '--version') {
     const inventory = options.inventory
         ? options.inventory(workspace)
         : [{ name: 'Project-A', agent: 'opencode', workspaces: [workspace] }];
+    const configFile = path.join(dir, 'sbxw.conf');
+    if (options.config !== undefined) fs.writeFileSync(configFile, options.config);
+    const inherited = { ...process.env };
+    for (const key of Object.keys(inherited)) {
+        if (key.startsWith('SBXW_')) delete inherited[key];
+    }
     const env = {
-        ...process.env,
+        ...inherited,
+        SBXW_CONFIG: configFile,
         PATH: `${bin}:${process.env.PATH}`,
         CALL_LOG: log,
         UPGRADE_LOG: upgrades,
@@ -98,6 +109,7 @@ if (args[0] === '--version') {
         AGENT_STATUS: '',
         FAIL_CONFIG_KEY: '',
         COPILOT_SETTINGS_FILE: copilotSettings,
+        ETC_DIR: etcDir,
         SBX_XCODE_MCP: 'xcode',
         SBX_EXA_MCP: 'exa',
         ...options.env,
@@ -105,8 +117,9 @@ if (args[0] === '--version') {
     const readLog = file => fs.existsSync(file)
         ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse)
         : [];
+    const recordFile = path.join(etcDir, 'attachments.json');
     return {
-        dir, bin, workspace, env, copilotSettings,
+        dir, bin, workspace, env, copilotSettings, recordFile,
         run(args = [], input = '') {
             return spawnSync('/bin/bash', [script, ...args], {
                 cwd: workspace, env, input, encoding: 'utf8',
@@ -114,6 +127,13 @@ if (args[0] === '--version') {
         },
         calls: () => readLog(log),
         upgrades: () => readLog(upgrades),
+        record: () => fs.existsSync(recordFile)
+            ? JSON.parse(fs.readFileSync(recordFile, 'utf8'))
+            : null,
+        seedRecord: value => {
+            fs.mkdirSync(etcDir, { recursive: true });
+            fs.writeFileSync(recordFile, JSON.stringify(value));
+        },
     };
 }
 
@@ -121,7 +141,7 @@ test('opening an existing sandbox reuses it, runs MCP loads and update, passes a
     const f = fixture(t);
     const result = f.run(['opencode', 'Project-A', '--', '--continue', 'argument with spaces']);
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(f.calls().map(c => c[0]), ['ls', 'mcp', 'mcp', 'exec', 'run']);
+    assert.deepEqual(f.calls().map(c => c[0]), ['ls', 'mcp', 'mcp', 'exec', 'exec', 'run']);
     assert.deepEqual(f.calls()[1], ['mcp', 'load', 'xcode', '--sandbox', 'Project-A']);
     assert.deepEqual(f.calls()[2], ['mcp', 'load', 'exa', '--sandbox', 'Project-A']);
     assert.deepEqual(f.upgrades(), [['upgrade'], ['upgrade', '--major']]);
@@ -241,7 +261,7 @@ test('copilot folder-based inventory still configures Copilot before launch', t 
         inventory: w => [{ name: 'Assistant', agent: 'copilot', workspaces: [w] }],
     });
     assert.equal(f.run(['copilot', 'Assistant']).status, 0);
-    assert.deepEqual(f.calls().filter(c => c[0] === 'exec'), [
+    assert.deepEqual(f.calls().filter(c => c[0] === 'exec' && c[2] === 'copilot'), [
         ['exec', 'Assistant', 'copilot', 'config', '--global', 'model', 'auto'],
         ['exec', 'Assistant', 'copilot', 'config', '--global', 'autoTier', 'balance'],
     ]);
@@ -431,5 +451,336 @@ test('uninstaller rejects invalid arguments and does not recursively remove dire
         assert.ok(result.stderr.length > 0);
         assert.doesNotMatch(result.stdout, /Removed/);
         assert.equal(fs.readFileSync(file, 'utf8'), 'keep');
+    }
+});
+
+function openCodeConfigArg(run) {
+    return run.find(arg => arg.startsWith('OPENCODE_CONFIG_CONTENT='));
+}
+
+test('settings file customizes OpenCode model, providers, and MCP servers', t => {
+    const f = fixture(t, {
+        config: [
+            '# personal settings',
+            'SBXW_OPENCODE_MODEL="openrouter/openai/gpt-5"',
+            'SBXW_OPENCODE_PROVIDERS=openrouter anthropic',
+            'SBXW_MCP_SERVERS=xcode  docs',
+            '',
+        ].join('\n'),
+    });
+    const result = f.run(['opencode', 'Project-A']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls()[1], ['mcp', 'load', 'xcode', '--sandbox', 'Project-A']);
+    assert.deepEqual(f.calls()[2], ['mcp', 'load', 'docs', '--sandbox', 'Project-A']);
+    const config = JSON.parse(openCodeConfigArg(f.calls().at(-1)).slice('OPENCODE_CONFIG_CONTENT='.length));
+    assert.equal(config.model, 'openrouter/openai/gpt-5');
+    assert.deepEqual(config.policies, [
+        { action: 'provider.use', resource: '*', effect: 'deny' },
+        { action: 'provider.use', resource: 'openrouter', effect: 'allow' },
+        { action: 'provider.use', resource: 'anthropic', effect: 'allow' },
+    ]);
+});
+
+test('environment variables override the settings file', t => {
+    const f = fixture(t, {
+        config: 'SBXW_OPENCODE_MODEL=openrouter/from-file\n',
+        env: { SBXW_OPENCODE_MODEL: 'openrouter/from-env' },
+    });
+    assert.equal(f.run(['opencode', 'Project-A']).status, 0);
+    const config = JSON.parse(openCodeConfigArg(f.calls().at(-1)).slice('OPENCODE_CONFIG_CONTENT='.length));
+    assert.equal(config.model, 'openrouter/from-env');
+});
+
+test('settings file customizes Copilot model and tier', t => {
+    const f = fixture(t, {
+        inventory: w => [{ name: 'assistant', agent: 'copilot', workspaces: [w] }],
+        config: 'SBXW_COPILOT_MODEL=claude-sonnet\nSBXW_COPILOT_TIER=intelligence\n',
+    });
+    assert.equal(f.run(['copilot', 'assistant']).status, 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(f.copilotSettings, 'utf8')), {
+        model: 'claude-sonnet', autoTier: 'intelligence', theme: 'keep',
+    });
+});
+
+test('OpenCode update failure on V2 still launches with a warning', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3', env: { FAIL_UPGRADE: '1' } });
+    const result = f.run(['opencode', 'Project-A']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /update failed; continuing with V2/);
+    assert.ok(f.calls().some(c => c[0] === 'run'));
+});
+
+for (const [title, config, message] of [
+    ['unknown setting', 'SBXW_BOGUS=1\n', /Unknown setting/],
+    ['malformed line', 'hello world\n', /Invalid line/],
+    ['invalid provider name', 'SBXW_OPENCODE_PROVIDERS=Bad*\n', /Invalid provider name/],
+    ['invalid MCP server name', 'SBXW_MCP_SERVERS=xcode;rm\n', /Invalid MCP server name/],
+    ['invalid model characters', 'SBXW_OPENCODE_MODEL=a b\n', /not allowed/],
+    ['invalid Copilot tier', 'SBXW_COPILOT_TIER=fast\n', /efficiency, balance, or intelligence/],
+]) {
+    test(`fails safely before any sbx call: ${title}`, t => {
+        const f = fixture(t, { config });
+        const result = f.run(['opencode', 'Project-A']);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, message);
+        assert.equal(f.calls().length, 0);
+    });
+}
+
+test('an empty provider setting falls back to OpenRouter only', t => {
+    const f = fixture(t, { config: 'SBXW_OPENCODE_PROVIDERS=   \n' });
+    assert.equal(f.run(['opencode', 'Project-A']).status, 0);
+    const config = JSON.parse(openCodeConfigArg(f.calls().at(-1)).slice('OPENCODE_CONFIG_CONTENT='.length));
+    assert.deepEqual(config, openCodeConfig);
+});
+
+function folder(f, name) {
+    const dirPath = path.join(f.dir, name);
+    fs.mkdirSync(dirPath, { recursive: true });
+    return fs.realpathSync(dirPath);
+}
+
+const mounts = f => f.calls().filter(c => c[0] === 'mount');
+const umounts = f => f.calls().filter(c => c[0] === 'umount');
+
+test('attach adds a read-write folder to a running sandbox and records it', t => {
+    const f = fixture(t);
+    const extra = folder(f, 'extra');
+    const result = f.run(['attach', 'Project-A', extra]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(mounts(f), [['mount', 'Project-A', extra]]);
+    assert.deepEqual(f.record().attachments, [{ path: extra, mode: 'rw', lifetime: 'always' }]);
+});
+
+test('attach --ro mounts read-only', t => {
+    const f = fixture(t);
+    const extra = folder(f, 'extra');
+    assert.equal(f.run(['attach', 'Project-A', extra, '--ro']).status, 0);
+    assert.deepEqual(mounts(f), [['mount', 'Project-A', `${extra}:${extra}:ro`]]);
+    assert.equal(f.record().attachments[0].mode, 'ro');
+});
+
+test('attach of an already attached folder does not mount it again', t => {
+    const f = fixture(t);
+    const extra = folder(f, 'extra');
+    assert.equal(f.run(['attach', 'Project-A', extra]).status, 0);
+    const again = f.run(['attach', 'Project-A', extra]);
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stderr, /already attached/);
+    assert.equal(mounts(f).length, 1);
+});
+
+test('attach of the primary folder mounts nothing', t => {
+    const f = fixture(t);
+    const result = f.run(['attach', 'Project-A', f.workspace]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /primary folder/);
+    assert.equal(mounts(f).length, 0);
+});
+
+test('attach rejects --once, which belongs to launches', t => {
+    const f = fixture(t);
+    const result = f.run(['attach', 'Project-A', folder(f, 'extra'), '--once']);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--once applies only/);
+    assert.equal(f.calls().length, 0);
+});
+
+test('attach fails for an unknown sandbox and for a missing folder', t => {
+    const f = fixture(t);
+    const unknown = f.run(['attach', 'nope', folder(f, 'extra')]);
+    assert.notEqual(unknown.status, 0);
+    assert.match(unknown.stderr, /No sandbox named 'nope'/);
+    const missing = f.run(['attach', 'Project-A', path.join(f.dir, 'missing')]);
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /Not a folder/);
+    assert.equal(mounts(f).length, 0);
+});
+
+test('a failed mount is reported and nothing is recorded', t => {
+    const f = fixture(t, { env: { FAIL_COMMAND: 'mount' } });
+    const result = f.run(['attach', 'Project-A', folder(f, 'extra')]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Could not attach/);
+    assert.equal(f.record(), null);
+});
+
+test('detach removes a mount and its record entry', t => {
+    const f = fixture(t);
+    const extra = folder(f, 'extra');
+    assert.equal(f.run(['attach', 'Project-A', extra]).status, 0);
+    const result = f.run(['detach', 'Project-A', extra]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(umounts(f), [['umount', 'Project-A', extra]]);
+    assert.deepEqual(f.record().attachments, []);
+});
+
+test('detach of a folder that is not attached fails', t => {
+    const f = fixture(t);
+    const result = f.run(['detach', 'Project-A', folder(f, 'extra')]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /is not attached/);
+    assert.equal(umounts(f).length, 0);
+});
+
+test('detach refuses the primary folder', t => {
+    const f = fixture(t);
+    const result = f.run(['detach', 'Project-A', f.workspace]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /primary folder/);
+});
+
+test('a failed unmount keeps the record entry', t => {
+    const f = fixture(t, { env: { FAIL_COMMAND: 'umount' } });
+    const folderPath = folder(f, 'extra');
+    f.seedRecord({ version: 1, attachments: [{ path: folderPath, mode: 'rw', lifetime: 'always' }] });
+    const result = f.run(['detach', 'Project-A', folderPath]);
+    assert.notEqual(result.status, 0);
+    assert.equal(f.record().attachments.length, 1);
+});
+
+test('folders lists the primary folder and attached folders', t => {
+    const f = fixture(t);
+    const extra = folder(f, 'extra');
+    f.seedRecord({
+        version: 1,
+        attachments: [{ path: extra, mode: 'ro', lifetime: 'always' }],
+    });
+    const result = f.run(['folders', 'Project-A']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`${f.workspace}\\s+rw\\s+primary`));
+    assert.match(result.stdout, new RegExp(`${extra}\\s+ro\\s+always`));
+});
+
+test('folders reports an invalid record', t => {
+    const f = fixture(t);
+    f.seedRecord({ version: 2 });
+    const result = f.run(['folders', 'Project-A']);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not valid/);
+});
+
+test('launch attaches --attach folders before the agent starts, and records them', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    const extra = folder(f, 'extra');
+    const result = f.run(['opencode', 'Project-A', '--attach', extra]);
+    assert.equal(result.status, 0, result.stderr);
+    const order = f.calls().map(c => c[0]);
+    assert.ok(order.indexOf('mount') < order.indexOf('run'));
+    assert.deepEqual(mounts(f), [['mount', 'Project-A', extra]]);
+    assert.deepEqual(f.record().attachments, [{ path: extra, mode: 'rw', lifetime: 'always' }]);
+});
+
+test('launch --attach --ro --once detaches the folder when the agent exits', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    const extra = folder(f, 'extra');
+    const result = f.run(['opencode', 'Project-A', '--attach', extra, '--ro', '--once']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(mounts(f), [['mount', 'Project-A', `${extra}:${extra}:ro`]]);
+    const order = f.calls().map(c => c[0]);
+    assert.ok(order.indexOf('run') < order.lastIndexOf('umount'));
+    assert.deepEqual(umounts(f), [['umount', 'Project-A', extra]]);
+    assert.deepEqual(f.record().attachments, []);
+});
+
+test('a once folder is detached even when the agent exits with an error', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3', env: { AGENT_STATUS: '5' } });
+    const extra = folder(f, 'extra');
+    const result = f.run(['opencode', 'Project-A', '--attach', extra, '--once']);
+    assert.equal(result.status, 5, result.stderr);
+    assert.equal(umounts(f).length, 1);
+    assert.deepEqual(f.record().attachments, []);
+});
+
+test('a once folder left over from an earlier session is detached at the next launch', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    const stale = folder(f, 'stale');
+    f.seedRecord({ version: 1, attachments: [{ path: stale, mode: 'rw', lifetime: 'once' }] });
+    const result = f.run(['opencode', 'Project-A']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(umounts(f), [['umount', 'Project-A', stale]]);
+    assert.deepEqual(f.record().attachments, []);
+    const order = f.calls().map(c => c[0]);
+    assert.ok(order.indexOf('umount') < order.indexOf('run'));
+});
+
+test('always folders are kept across launches', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    const kept = folder(f, 'kept');
+    f.seedRecord({ version: 1, attachments: [{ path: kept, mode: 'rw', lifetime: 'always' }] });
+    assert.equal(f.run(['opencode', 'Project-A']).status, 0);
+    assert.equal(umounts(f).length, 0);
+    assert.deepEqual(f.record().attachments, [{ path: kept, mode: 'rw', lifetime: 'always' }]);
+});
+
+test('a stale once folder that cannot be detached stops the launch', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3', env: { FAIL_COMMAND: 'umount' } });
+    const stale = folder(f, 'stale');
+    f.seedRecord({ version: 1, attachments: [{ path: stale, mode: 'rw', lifetime: 'once' }] });
+    const result = f.run(['opencode', 'Project-A']);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Could not detach/);
+    assert.ok(!f.calls().some(c => c[0] === 'run'));
+});
+
+test('a failed mount at launch aborts before the agent starts', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3', env: { FAIL_COMMAND: 'mount' } });
+    const result = f.run(['opencode', 'Project-A', '--attach', folder(f, 'extra')]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Could not attach/);
+    assert.ok(!f.calls().some(c => c[0] === 'run'));
+});
+
+test('a folder already attached at launch is not mounted again', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    const extra = folder(f, 'extra');
+    f.seedRecord({ version: 1, attachments: [{ path: extra, mode: 'rw', lifetime: 'always' }] });
+    const result = f.run(['opencode', 'Project-A', '--attach', extra]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(mounts(f).length, 0);
+});
+
+test('the folder record is written as root', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    assert.equal(f.run(['attach', 'Project-A', folder(f, 'extra')]).status, 0);
+    assert.ok(f.calls().some(c => c[0] === 'exec' && c[1] === '-u' && c[2] === 'root' && c[3] === 'Project-A'));
+});
+
+test('an invalid record in the sandbox stops the launch', t => {
+    const f = fixture(t, { version: 'opencode v2.1.3' });
+    f.seedRecord({ version: 1, attachments: 'nope' });
+    const result = f.run(['opencode', 'Project-A']);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /not valid/);
+    assert.ok(!f.calls().some(c => c[0] === 'run'));
+});
+
+for (const [title, args, message] of [
+    ['--ro without --attach', ['opencode', 'Project-A', '--ro'], /apply to folders given with --attach/],
+    ['--once without --attach', ['opencode', 'Project-A', '--once'], /apply to folders given with --attach/],
+    ['--attach without a path', ['opencode', 'Project-A', '--attach'], /needs a folder path/],
+    ['--attach with a colon', ['opencode', 'Project-A', '--attach', 'a:b'], /cannot contain ':'/],
+    ['--attach for a missing folder', ['opencode', 'Project-A', '--attach', '/no/such/folder'], /Not a folder/],
+    ['--attach on ls', ['ls', '--attach', '/tmp'], /ls takes no arguments/],
+    ['attach without a path', ['attach', 'Project-A'], /at least one folder path/],
+    ['detach without a name', ['detach'], /Usage: sbxw detach/],
+    ['folders with two names', ['folders', 'A', 'B'], /takes one sandbox name/],
+    ['agent arguments for attach', ['attach', 'Project-A', '/tmp', '--', 'x'], /Agent arguments apply only/],
+]) {
+    test(`fails safely before any sbx call: ${title}`, t => {
+        const f = fixture(t);
+        const result = f.run(args);
+        assert.notEqual(result.status, 0);
+        assert.match(result.stderr, message);
+        assert.equal(f.calls().length, 0);
+    });
+}
+
+test('help describes attach, detach, folders, and the launch options', t => {
+    const f = fixture(t);
+    const result = f.run(['--help']);
+    assert.equal(result.status, 0, result.stderr);
+    for (const word of ['attach', 'detach', 'folders', '--attach', '--ro', '--once', '/etc/sbxw/attachments.json']) {
+        assert.ok(result.stdout.includes(word), `help should mention ${word}`);
     }
 });

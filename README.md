@@ -42,6 +42,10 @@ sbxw copilot assistant           # open or create "assistant" (Copilot)
 sbxw opencode                    # prompt for a name, suggesting this folder's name
 sbxw opencode scratch --no-folder  # create "scratch" with no folder attached
 sbxw copilot assistant -- --resume # pass arguments to the agent after --
+sbxw opencode assistant --attach ~/docs  # also attach ~/docs for this launch
+sbxw attach assistant ~/shared --ro      # attach a folder to an existing sandbox
+sbxw detach assistant ~/shared           # detach it again
+sbxw folders assistant                   # list the primary and attached folders
 sbxw --help                      # full help
 ```
 
@@ -54,8 +58,11 @@ file), it prints the list and exits without launching anything.
 
 ### `sbxw opencode NAME` and `sbxw copilot NAME`
 
-- If a sandbox named `NAME` exists, it opens as it is. The current folder is
-  ignored, and the sandbox must belong to the same agent.
+- If a sandbox named `NAME` exists, it opens as it is, and the sandbox must
+  belong to the same agent. If the current folder is not attached to it, you
+  are asked whether to attach it: `n` (default) skips it, `o` attaches it for
+  this session only, and `a` attaches it until you detach it. The prompt
+  appears only in an interactive terminal.
 - If it does not exist, it is created for the current folder, then opened.
   `--no-folder` creates it without a host folder instead.
 - Names are normalized: `"Project A"` becomes `project-a`. Existing names
@@ -81,20 +88,85 @@ Everything after `--` is passed to the agent. For example, `-- --continue`
 continues the last OpenCode session, and `-- --resume` resumes the last
 Copilot conversation. The wrapper does not interpret these arguments.
 
+### Attaching folders
+
+Folders can be attached to a sandbox after it was created. They are mounted
+with `sbx mount`, so the agent sees them at the same path as on your Mac.
+
+- **Read-write by default.** Add `--ro` for read-only. Writes to a read-only
+  folder fail inside the sandbox.
+- **Always or once.** `attach` keeps a folder until you run `detach`. With
+  `opencode` or `copilot`, `--attach PATH --once` keeps it only for that
+  session: it is detached when the agent exits, including after an error.
+- **Launch options.** `--attach PATH` (repeatable) attaches before the agent
+  starts. `--ro` and `--once` apply to every `--attach` folder in the same
+  command.
+- **Existing folders.** Attaching a folder that is already attached does not
+  change it. Detach it first to change its mode or lifetime.
+- **Primary folder.** The folder a sandbox was created with cannot be attached
+  again or detached. `sbxw folders NAME` shows it.
+- **Stopped sandboxes.** `attach`, `detach`, and `folders` start a stopped
+  sandbox first, because `sbx mount` works only on a running sandbox.
+- **Record.** Attached folders are listed in `/etc/sbxw/attachments.json`
+  inside the sandbox. Only root can change it, and the wrapper writes it as
+  root. Removing the sandbox removes the record.
+- **Leftovers.** If a `--once` folder was not detached (for example, after a
+  crash), the next launch detaches it before the agent starts. Do not run two
+  sessions on the same sandbox at once if one of them uses `--once`: the first
+  session to exit detaches the other's folder.
+- **Support.** `sbx mount` and `sbx umount` are not in Docker's public
+  documentation. They were tested with `sbx` v0.50.1 on macOS. Check
+  `sbx mount --help` after upgrading `sbx`.
+- **Limit.** `sbxw ls` shows only the primary folder. Use `sbxw folders NAME`
+  to see attached folders, because listing them requires starting the sandbox.
+
+## Settings
+
+Settings come from `~/.config/sbxw/config`, or from the file named by
+`SBXW_CONFIG`. Environment variables override the file. Each line is
+`KEY=value`. Blank lines and lines starting with `#` are ignored. Unknown keys
+and malformed lines stop the launch before any sandbox is touched. An empty
+value uses the default.
+
+```bash
+# ~/.config/sbxw/config
+SBXW_OPENCODE_MODEL=openrouter/anthropic/claude-haiku-5.5
+SBXW_OPENCODE_PROVIDERS=openrouter
+SBXW_MCP_SERVERS=xcode exa
+SBXW_COPILOT_MODEL=auto
+SBXW_COPILOT_TIER=balance
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `SBXW_OPENCODE_MODEL` | `openrouter/anthropic/claude-haiku-5.5` | Default model for new OpenCode sessions. |
+| `SBXW_OPENCODE_PROVIDERS` | `openrouter` | Providers OpenCode may use, space separated. Other providers are denied. |
+| `SBXW_MCP_SERVERS` | `xcode exa` | MCP servers loaded on every launch, space separated. Each must be registered with `sbx mcp add`. |
+| `SBXW_COPILOT_MODEL` | `auto` | Default Copilot model. |
+| `SBXW_COPILOT_TIER` | `balance` | Copilot Auto tier: `efficiency`, `balance`, or `intelligence`. |
+
+`SBX_XCODE_MCP` and `SBX_EXA_MCP` still set the default server names when
+`SBXW_MCP_SERVERS` is not set.
+
 ## Launch behavior
 
-- Every launch loads `xcode` and `exa` with `sbx mcp load`, then attaches with
-  `sbx run --name`. Docker starts stopped sandboxes as needed. Errors stop the
-  launch rather than skipping MCP servers or updates.
+- Every launch loads each server in `SBXW_MCP_SERVERS` with `sbx mcp load`,
+  reads the folder record and starts the sandbox if needed, detaches leftover
+  `--once` folders, attaches any `--attach` folders, then attaches with
+  `sbx run --name`. Errors stop the launch rather than skipping MCP servers,
+  updates, or folder changes.
 - OpenCode runs `opencode upgrade` on every launch. If still on V1, it then
   runs `opencode upgrade --major` and verifies V2 before starting the agent.
-  Updating needs network access allowed by your sandbox policies.
+  Updating needs network access allowed by your sandbox policies. If the
+  update fails but OpenCode is already on V2, the launch continues with a
+  warning, so an offline launch still works. A failed migration from V1 stops
+  the launch.
   **V2 changes plugin and server APIs**; the wrapper does not rewrite your
   configuration or port plugins. Back up custom V1 configuration beforehand.
 - OpenCode launches with `OPENCODE_DISABLE_FREE_MODELS=1` to hide its free
   models. It also receives inline V2 `provider.use` policies that deny all
-  providers except `openrouter`. Anthropic and OpenAI models offered **through
-  OpenRouter** remain available. Configure your OpenRouter credential with
+  providers except those in `SBXW_OPENCODE_PROVIDERS` (default `openrouter`).
+  Anthropic and OpenAI models offered **through OpenRouter** remain available. Configure your OpenRouter credential with
   `sbx secret set openrouter`. These are launch-time settings, not edits to your
   config files. Higher-authority system or Console policies still take
   precedence. Use a fresh OpenCode server session for the settings to apply.
@@ -119,7 +191,7 @@ Copilot conversation. The wrapper does not interpret these arguments.
 Different MCP registration names:
 
 ```bash
-SBX_XCODE_MCP=my-xcode SBX_EXA_MCP=my-exa sbxw opencode assistant
+SBXW_MCP_SERVERS="my-xcode my-exa" sbxw opencode assistant
 ```
 
 ## Tests

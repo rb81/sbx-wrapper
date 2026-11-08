@@ -1,0 +1,697 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+die() {
+    printf 'sbxw: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: sbxw ls
+       sbxw opencode [NAME] [--no-folder] [--attach PATH...] [--ro] [--once] [-- AGENT_ARGS...]
+       sbxw copilot  [NAME] [--no-folder] [--attach PATH...] [--ro] [--once] [-- AGENT_ARGS...]
+       sbxw attach NAME PATH... [--ro]
+       sbxw detach NAME PATH...
+       sbxw folders NAME
+       sbxw -h | --help
+
+Commands:
+  ls          List all sandboxes in a menu. Up/Down (or k/j) moves, Enter opens
+              the highlighted sandbox, q or Esc cancels. Without an interactive
+              terminal, prints the list and exits.
+  opencode    Open or create an OpenCode sandbox.
+  copilot     Open or create a Copilot sandbox.
+  attach      Attach folders to a sandbox. Each stays attached across stops and
+              restarts until detached. Starts the sandbox if it is stopped.
+  detach      Detach folders attached with attach or --attach.
+  folders     List a sandbox's primary folder and its attached folders. Starts
+              the sandbox if it is stopped.
+
+Options for opencode and copilot:
+  NAME        Sandbox to open, or to create if it does not exist. "Project A"
+              becomes project-a. Names are unique across agents. If NAME is
+              omitted, you are prompted, and the prompt suggests the current
+              folder's name. A name that already exists is rejected at the
+              prompt, so give an existing sandbox's name to reopen it.
+  --no-folder Create the sandbox without a host folder. Its files are deleted
+              when the sandbox is removed; use sbx cp to move files in or out.
+  --attach PATH
+              Attach PATH before the agent starts. Repeatable. Read-write unless
+              --ro is given.
+  --ro        Attach the --attach folders read-only.
+  --once      Attach the --attach folders for this session only. They are
+              detached when the agent exits.
+  -- ARGS     Pass ARGS to the agent, for example -- --continue for OpenCode
+              or -- --resume for Copilot (resume the last Copilot conversation).
+  -h, --help  Show this help.
+
+Options for attach:
+  --ro        Attach read-only. Default: read-write.
+
+An existing sandbox always opens as it is, regardless of the current folder.
+When you open an existing sandbox from a folder it does not have, you are asked
+whether to attach it: no, once, or always. The current folder becomes the
+primary folder only when a sandbox is created, unless --no-folder is given.
+
+Attached folders are recorded in /etc/sbxw/attachments.json inside the sandbox.
+Folders are mounted with sbx mount and removed with sbx umount.
+
+Every launch loads the xcode and exa MCP servers with sbx mcp load.
+Names of those registrations can be changed with SBX_XCODE_MCP and SBX_EXA_MCP.
+OpenCode is updated and migrated from V1 to V2. It hides free models and
+enables only the OpenRouter provider. Its default model is Claude Haiku 5.5.
+Copilot runs with --sync-session=off and saves Auto Balance as its default.
+
+Settings come from ~/.config/sbxw/config (or the file named by SBXW_CONFIG).
+Environment variables override the file. Each line is KEY=value, and # starts
+a comment. Available settings:
+  SBXW_OPENCODE_MODEL      OpenCode default model. Default openrouter/anthropic/claude-haiku-5.5.
+  SBXW_OPENCODE_PROVIDERS  Providers OpenCode may use, space separated. Default openrouter.
+  SBXW_MCP_SERVERS         MCP servers to load, space separated. Default xcode exa.
+  SBXW_COPILOT_MODEL       Copilot default model. Default auto.
+  SBXW_COPILOT_TIER        Copilot Auto tier: efficiency, balance, or intelligence. Default balance.
+EOF
+}
+
+normalize_name() {
+    LC_ALL=C printf '%s' "$1" |
+        LC_ALL=C tr '[:upper:]' '[:lower:]' |
+        LC_ALL=C sed -E 's/[^a-z0-9.-]+/-/g; s/^[.-]+//; s/-+$//'
+}
+
+valid_name() {
+    [[ $1 =~ ^[a-z0-9][a-z0-9.-]+$ && $1 != default ]]
+}
+
+config_file=${SBXW_CONFIG:-"${XDG_CONFIG_HOME:-$HOME/.config}/sbxw/config"}
+setting_keys=' SBXW_OPENCODE_MODEL SBXW_OPENCODE_PROVIDERS SBXW_MCP_SERVERS SBXW_COPILOT_MODEL SBXW_COPILOT_TIER '
+
+load_config() {
+    local line key value
+    [[ -f $config_file ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*# ]] && continue
+        [[ $line =~ ^[[:space:]]*(SBXW_[A-Z_]+)[[:space:]]*=(.*)$ ]] ||
+            die "Invalid line in $config_file: $line"
+        key=${BASH_REMATCH[1]}
+        value=$(printf '%s' "${BASH_REMATCH[2]}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        case $value in
+            \"*\") value=${value#\"}; value=${value%\"} ;;
+        esac
+        case $setting_keys in
+            *" $key "*) ;;
+            *) die "Unknown setting in $config_file: $key" ;;
+        esac
+        if [[ -z ${!key+x} ]]; then
+            printf -v "$key" '%s' "$value"
+        fi
+    done < "$config_file"
+}
+
+apply_defaults() {
+    : "${SBXW_OPENCODE_MODEL:=openrouter/anthropic/claude-haiku-5.5}"
+    : "${SBXW_OPENCODE_PROVIDERS:=openrouter}"
+    : "${SBXW_MCP_SERVERS:=${SBX_XCODE_MCP:-xcode} ${SBX_EXA_MCP:-exa}}"
+    : "${SBXW_COPILOT_MODEL:=auto}"
+    : "${SBXW_COPILOT_TIER:=balance}"
+}
+
+validate_settings() {
+    local item
+    [[ $SBXW_OPENCODE_MODEL =~ ^[A-Za-z0-9._/:-]+$ ]] ||
+        die "SBXW_OPENCODE_MODEL contains characters that are not allowed."
+    read -r -a opencode_providers <<<"$SBXW_OPENCODE_PROVIDERS"
+    [[ ${#opencode_providers[@]} -gt 0 ]] ||
+        die "SBXW_OPENCODE_PROVIDERS needs at least one provider."
+    for item in "${opencode_providers[@]}"; do
+        [[ $item =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die "Invalid provider name: $item"
+    done
+    read -r -a mcp_servers <<<"$SBXW_MCP_SERVERS"
+    [[ ${#mcp_servers[@]} -gt 0 ]] || die "SBXW_MCP_SERVERS needs at least one server."
+    for item in "${mcp_servers[@]}"; do
+        [[ $item =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Invalid MCP server name: $item"
+    done
+    [[ $SBXW_COPILOT_MODEL =~ ^[A-Za-z0-9._/:-]+$ ]] ||
+        die "SBXW_COPILOT_MODEL contains characters that are not allowed."
+    case $SBXW_COPILOT_TIER in
+        efficiency|balance|intelligence) ;;
+        *) die "SBXW_COPILOT_TIER must be efficiency, balance, or intelligence." ;;
+    esac
+}
+
+opencode_provider_config() {
+    local providers_json
+    providers_json=$(printf '%s\n' "${opencode_providers[@]}" | jq -R . | jq -sc .)
+    jq -nc --arg model "$SBXW_OPENCODE_MODEL" --argjson providers "$providers_json" '
+        {
+            model: $model,
+            policies: ([{action: "provider.use", resource: "*", effect: "deny"}] +
+                ($providers | map({action: "provider.use", resource: ., effect: "allow"})))
+        }'
+}
+
+is_taken() {
+    jq -e --arg name "$1" 'any(.[]; (.name | ascii_downcase) == $name)' \
+        <<<"$inventory" >/dev/null
+}
+
+find_sandbox() {
+    local normalized
+    found=$(jq -r --arg name "$1" \
+        'first(.[] | select(.name == $name) | .name) // empty' <<<"$inventory")
+    if [[ -z $found ]]; then
+        normalized=$(normalize_name "$1")
+        found=$(jq -r --arg name "$normalized" \
+            'first(.[] | select((.name | ascii_downcase) == $name) | .name) // empty' \
+            <<<"$inventory")
+    fi
+}
+
+primary_folder() {
+    jq -r --arg n "$1" \
+        'first(.[] | select(.name == $n) | ((.workspaces // [])[0] // empty)) // empty' \
+        <<<"$inventory"
+}
+
+prompt_for_name() {
+    local default= label
+    if [[ -z $no_folder ]]; then
+        default=$(normalize_name "$(basename -- "$workspace")")
+        valid_name "$default" || default=
+    fi
+    while :; do
+        if [[ -n $default ]]; then
+            printf 'Sandbox name [%s]: ' "$default" >&2
+        else
+            printf 'Sandbox name: ' >&2
+        fi
+        IFS= read -r label || die "Could not read a sandbox name."
+        [[ -n $label ]] || label=$default
+        name=$(normalize_name "$label")
+        if ! valid_name "$name"; then
+            printf 'Use at least two letters or numbers; "default" is reserved.\n' >&2
+        elif is_taken "$name"; then
+            printf "Name '%s' is already taken. Choose another name.\n" "$name" >&2
+        else
+            return 0
+        fi
+    done
+}
+
+create_sandbox() {
+    printf 'Creating %s\n' "$name" >&2
+    if [[ -n $no_folder ]]; then
+        sbx create --name "$name" "$agent"
+    else
+        sbx create --name "$name" "$agent" "$workspace"
+        primary=$workspace
+    fi
+}
+
+choose_sandbox() {
+    local count=${#names[@]} index=0 lines=$((${#names[@]} + 2)) drawn= i key rest
+    printf '\033[?25l' >&2
+    while :; do
+        [[ -z $drawn ]] || printf '\033[%dA' "$lines" >&2
+        drawn=1
+        printf '\033[2K Up/Down move, Enter opens, q cancels\n' >&2
+        printf '\033[2K   %-24s %-10s %s\n' NAME AGENT FOLDER >&2
+        for ((i = 0; i < count; i++)); do
+            if ((i == index)); then
+                printf '\033[2K\033[7m > %-24s %-10s %s \033[0m\n' \
+                    "${names[i]}" "${agents[i]}" "${folders[i]}" >&2
+            else
+                printf '\033[2K   %-24s %-10s %s\n' \
+                    "${names[i]}" "${agents[i]}" "${folders[i]}" >&2
+            fi
+        done
+        key=
+        IFS= read -rsn1 key || key=q
+        case $key in
+            $'\033')
+                rest=
+                IFS= read -rsn2 -t 1 rest || true
+                case $rest in
+                    '[A'|'OA') index=$(((index + count - 1) % count)) ;;
+                    '[B'|'OB') index=$(((index + 1) % count)) ;;
+                    *) printf '\033[?25h' >&2; return 1 ;;
+                esac
+                ;;
+            k) index=$(((index + count - 1) % count)) ;;
+            j) index=$(((index + 1) % count)) ;;
+            '') chosen=$index; printf '\033[?25h' >&2; return 0 ;;
+            q|Q) printf '\033[?25h' >&2; return 1 ;;
+        esac
+    done
+}
+
+# Sets resolved_folder to the absolute path of an existing folder.
+resolve_folder() {
+    local path=$1
+    [[ -n $path ]] || die "Folder path cannot be empty."
+    [[ $path != *:* ]] || die "Folder paths cannot contain ':': $path"
+    [[ -d $path ]] || die "Not a folder: $path"
+    resolved_folder=$(cd -- "$path" && pwd -P) || die "Cannot read folder: $path"
+}
+
+# Like resolve_folder, but also accepts an absolute path to a folder that was
+# deleted, so that it can still be detached.
+resolve_detach_folder() {
+    local path=$1
+    if [[ -d $path ]]; then
+        resolve_folder "$path"
+    elif [[ $path == /* && $path != *:* ]]; then
+        resolved_folder=$path
+    else
+        die "Not a folder: $path (use an absolute path for a folder that no longer exists)"
+    fi
+}
+
+empty_record='{"version":1,"attachments":[]}'
+
+# Reads the folder record from the sandbox into record. Starts the sandbox.
+read_record() {
+    local name=$1 json
+    json=$(sbx exec "$name" sh -c 'cat /etc/sbxw/attachments.json 2>/dev/null || printf "%s\n" "$1"' sh "$empty_record") ||
+        die "Could not read the folder record in $name."
+    jq -e '.version == 1 and (.attachments | type == "array")' <<<"$json" >/dev/null 2>&1 ||
+        die "The folder record in $name is not valid. Remove /etc/sbxw/attachments.json in the sandbox to reset it."
+    record=$json
+}
+
+# Writes the folder record as root. Returns non-zero on failure.
+write_record() {
+    local name=$1 json=$2
+    sbx exec -u root "$name" sh -c \
+        'mkdir -p /etc/sbxw && printf "%s\n" "$1" > /etc/sbxw/attachments.json.tmp && mv /etc/sbxw/attachments.json.tmp /etc/sbxw/attachments.json' \
+        sh "$json" || return 1
+    record=$json
+}
+
+mount_spec() {
+    if [[ $2 == ro ]]; then
+        printf '%s:%s:ro' "$1" "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# attach_folder NAME HOST_PATH MODE LIFETIME
+attach_folder() {
+    local name=$1 host=$2 mode=$3 lifetime=$4 current updated
+    if [[ $host == "$primary" ]]; then
+        printf '%s is the primary folder of %s. Nothing to attach.\n' "$host" "$name" >&2
+        return 0
+    fi
+    current=$(jq -r --arg p "$host" \
+        'first(.attachments[] | select(.path == $p) | "\(.mode) \(.lifetime)") // empty' <<<"$record")
+    if [[ -n $current ]]; then
+        printf '%s is already attached to %s (%s). Detach it first to change it.\n' \
+            "$host" "$name" "$current" >&2
+        return 0
+    fi
+    sbx mount "$name" "$(mount_spec "$host" "$mode")" >/dev/null ||
+        die "Could not attach $host to $name."
+    updated=$(jq -c --arg p "$host" --arg m "$mode" --arg l "$lifetime" \
+        '.attachments += [{path: $p, mode: $m, lifetime: $l}]' <<<"$record")
+    if ! write_record "$name" "$updated"; then
+        sbx umount "$name" "$host" >/dev/null 2>&1 || true
+        die "Could not record $host in $name, so it was detached again."
+    fi
+    if [[ $lifetime == once ]]; then
+        session_once+=("$host")
+    fi
+    printf 'Attached %s to %s (%s, %s).\n' "$host" "$name" "$mode" "$lifetime" >&2
+}
+
+# detach_folder NAME HOST_PATH
+detach_folder() {
+    local name=$1 host=$2 lifetime updated
+    if [[ $host == "$primary" ]]; then
+        die "$host is the primary folder of $name and cannot be detached."
+    fi
+    lifetime=$(jq -r --arg p "$host" \
+        'first(.attachments[] | select(.path == $p) | .lifetime) // empty' <<<"$record")
+    [[ -n $lifetime ]] || die "$host is not attached to $name."
+    sbx umount "$name" "$host" >/dev/null ||
+        die "Could not detach $host from $name."
+    updated=$(jq -c --arg p "$host" '.attachments |= map(select(.path != $p))' <<<"$record")
+    write_record "$name" "$updated" ||
+        die "Detached $host, but could not update the folder record in $name. Run: sbxw folders $name"
+    printf 'Detached %s from %s.\n' "$host" "$name" >&2
+}
+
+# Runs before the agent starts: removes leftovers from earlier sessions,
+# attaches the --attach folders, and offers the current folder if it is new.
+prepare_attachments() {
+    local name=$1 host stale updated answer
+    stale=$(jq -r '.attachments[] | select(.lifetime == "once") | .path' <<<"$record")
+    while IFS= read -r host; do
+        [[ -n $host ]] || continue
+        printf 'Detaching %s, left attached by an earlier session.\n' "$host" >&2
+        sbx umount "$name" "$host" >/dev/null ||
+            die "Could not detach $host from $name. Run: sbxw detach $name $host"
+    done <<<"$stale"
+    if [[ -n $stale ]]; then
+        updated=$(jq -c '.attachments |= map(select(.lifetime != "once"))' <<<"$record")
+        write_record "$name" "$updated" ||
+            die "Could not update the folder record in $name."
+    fi
+    for host in ${attach_paths[@]+"${attach_paths[@]}"}; do
+        attach_folder "$name" "$host" "$attach_mode" "$attach_lifetime"
+    done
+    if [[ -n $offer_folder && ${#attach_paths[@]} -eq 0 && $workspace != "$primary" ]] &&
+        ! jq -e --arg p "$workspace" 'any(.attachments[]; .path == $p)' <<<"$record" >/dev/null; then
+        printf 'Attach %s to %s? [n]o / [o]nce / [a]lways: ' "$workspace" "$name" >&2
+        IFS= read -r answer || answer=
+        case $answer in
+            o|once) attach_folder "$name" "$workspace" rw once ;;
+            a|always) attach_folder "$name" "$workspace" rw always ;;
+        esac
+    fi
+}
+
+# Detaches the --once folders attached by this session and removes them from
+# the record. Runs on exit.
+release_once_folders() {
+    local host paths_json updated
+    ((${#session_once[@]})) || return 0
+    for host in "${session_once[@]}"; do
+        sbx umount "$launch_name" "$host" >/dev/null 2>&1 ||
+            printf 'sbxw: could not detach %s. Run: sbxw detach %s %s\n' \
+                "$host" "$launch_name" "$host" >&2
+    done
+    paths_json=$(jq -cn '$ARGS.positional' --args "${session_once[@]}")
+    read_record "$launch_name"
+    updated=$(jq -c --argjson ps "$paths_json" \
+        '.attachments |= map(select(.path as $p | ($ps | any(. == $p)) | not))' <<<"$record")
+    write_record "$launch_name" "$updated" ||
+        printf 'sbxw: could not update the folder record in %s.\n' "$launch_name" >&2
+    session_once=()
+}
+
+show_folders() {
+    local path mode lifetime
+    printf '%-64s %-5s %s\n' FOLDER MODE LIFETIME
+    if [[ -n $primary ]]; then
+        printf '%-64s %-5s %s\n' "$primary" rw primary
+    else
+        printf '%-64s %-5s %s\n' "(no folder)" - primary
+    fi
+    while IFS=$'\t' read -r path mode lifetime; do
+        printf '%-64s %-5s %s\n' "$path" "$mode" "$lifetime"
+    done < <(jq -r '.attachments[] | [.path, .mode, .lifetime] | @tsv' <<<"$record")
+}
+
+launch_sandbox() {
+    local agent=$1 name=$2 run_status=0 server provider_config
+    agent_status=0
+    shift 2
+    [[ $agent == opencode || $agent == copilot ]] ||
+        die "'$name' uses $agent, which sbxw does not support."
+    for server in "${mcp_servers[@]}"; do
+        sbx mcp load "$server" --sandbox "$name"
+    done
+
+    read_record "$name"
+    prepare_attachments "$name"
+
+    if [[ $agent == opencode ]]; then
+        printf 'Updating OpenCode in %s...\n' "$name" >&2
+        sbx exec "$name" bash -c '
+            set -euo pipefail
+            major_version() {
+                local version
+                version=$(opencode --version)
+                if [[ $version =~ (^|[[:space:]])v?([0-9]+)\. ]]; then
+                    printf "%s\n" "${BASH_REMATCH[2]}"
+                else
+                    printf "Cannot parse OpenCode version: %s\n" "$version" >&2
+                    return 1
+                fi
+            }
+            update_ok=1
+            opencode upgrade || update_ok=0
+            hash -r
+            major=$(major_version)
+            if [[ $major == 1 ]]; then
+                opencode upgrade --major || update_ok=0
+                hash -r
+            fi
+            major=$(major_version)
+            if [[ $major -lt 2 ]]; then
+                printf "OpenCode migration did not install V2; launch aborted.\n" >&2
+                exit 1
+            fi
+            if [[ $update_ok == 0 ]]; then
+                printf "OpenCode update failed; continuing with V%s.\n" "$major" >&2
+            fi
+            opencode --version
+        '
+        provider_config=$(opencode_provider_config)
+        sbx run --name "$name" \
+            -e OPENCODE_DISABLE_FREE_MODELS=1 \
+            -e "OPENCODE_CONFIG_CONTENT=$provider_config" -- "$@" || run_status=$?
+    else
+        printf 'Updating Copilot in %s...\n' "$name" >&2
+        sbx exec "$name" sh -c '
+            copilot update || printf "Copilot update failed; checking the installed version.\n" >&2
+            if ! copilot --help | grep -q -- --sync-session; then
+                printf "%s has no --sync-session option; launch aborted.\n" "$(copilot --version | head -n 1)" >&2
+                exit 1
+            fi
+        '
+        sbx exec "$name" python3 -c '
+import json, os, sys
+home = os.environ.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"), ".copilot")
+path = os.path.join(home, "settings.json")
+os.makedirs(home, exist_ok=True)
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except FileNotFoundError:
+    settings = {}
+settings["model"] = sys.argv[1]
+settings["autoTier"] = sys.argv[2]
+with open(path + ".tmp", "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+os.replace(path + ".tmp", path)
+' "$SBXW_COPILOT_MODEL" "$SBXW_COPILOT_TIER"
+        local workdir_args=()
+        [[ -n $primary ]] && workdir_args=(-w "$primary")
+        sbx exec -it ${workdir_args[@]+"${workdir_args[@]}"} "$name" \
+            copilot --yolo --sync-session=off "$@" || run_status=$?
+    fi
+    agent_status=$run_status
+}
+
+subcommand=
+agent=
+case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+    ls) subcommand=ls; shift ;;
+    opencode|copilot) subcommand=launch; agent=$1; shift ;;
+    attach|detach|folders) subcommand=$1; shift ;;
+    '') usage >&2; exit 2 ;;
+    *) die "Unknown command: $1. Run sbxw --help." ;;
+esac
+
+name=
+no_folder=
+attach_paths=()
+attach_ro=
+attach_once=
+session_once=()
+offer_folder=
+record=
+primary=
+launch_name=
+resolved_folder=
+found=
+if [[ $subcommand == ls ]]; then
+    if [[ ${1:-} == -h || ${1:-} == --help ]]; then usage; exit 0; fi
+    [[ $# -eq 0 ]] || die "ls takes no arguments. Run sbxw --help."
+else
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --no-folder)
+                [[ $subcommand == launch ]] || die "--no-folder applies only to opencode and copilot."
+                no_folder=1; shift ;;
+            --attach)
+                [[ $subcommand == launch ]] || die "--attach applies only to opencode and copilot. Use sbxw attach NAME PATH."
+                [[ $# -ge 2 && -n $2 ]] || die "--attach needs a folder path."
+                attach_paths+=("$2"); shift 2 ;;
+            --ro)
+                [[ $subcommand == launch || $subcommand == attach ]] || die "--ro does not apply to $subcommand."
+                attach_ro=1; shift ;;
+            --once)
+                [[ $subcommand == launch ]] || die "--once applies only to opencode and copilot with --attach."
+                attach_once=1; shift ;;
+            --) shift; break ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "Unknown option: $1. Run sbxw --help." ;;
+            *)
+                [[ -n $1 ]] || die "Sandbox name cannot be empty."
+                if [[ -z $name ]]; then
+                    name=$1
+                elif [[ $subcommand == attach || $subcommand == detach ]]; then
+                    attach_paths+=("$1")
+                elif [[ $subcommand == launch ]]; then
+                    die "Only one sandbox name is allowed. Put agent arguments after --."
+                else
+                    die "folders takes one sandbox name. Run sbxw --help."
+                fi
+                shift
+                ;;
+        esac
+    done
+    if [[ $subcommand != launch && $# -gt 0 ]]; then
+        die "Agent arguments apply only to opencode and copilot. Run sbxw --help."
+    fi
+    if [[ $subcommand == attach || $subcommand == detach ]]; then
+        [[ -n $name ]] || die "Usage: sbxw $subcommand NAME PATH... Run sbxw --help."
+        [[ ${#attach_paths[@]} -gt 0 ]] || die "Give at least one folder path."
+    fi
+    if [[ $subcommand == folders && -z $name ]]; then
+        die "Usage: sbxw folders NAME. Run sbxw --help."
+    fi
+    if [[ $subcommand == launch && ${#attach_paths[@]} -eq 0 && ( -n $attach_ro || -n $attach_once ) ]]; then
+        die "--ro and --once apply to folders given with --attach."
+    fi
+fi
+if [[ $subcommand == launch && $agent == copilot ]]; then
+    for arg in "$@"; do
+        case "$arg" in
+            --remote|--remote=*|--no-remote|--no-remote=*)
+                die "Copilot removed --remote/--no-remote. Use /remote off in a session." ;;
+            --connect|--connect=*|--host-environment|--host-environment=*|--host-ahp|--host-ahp=*)
+                die "Remote connection and hosting options are disabled by this wrapper." ;;
+            --sync-session|--sync-session=*)
+                die "Session sync is disabled by this wrapper (--sync-session=off)." ;;
+        esac
+    done
+fi
+
+trap 'printf "sbxw: command failed at line %s (exit %s); launch aborted.\n" "$LINENO" "$?" >&2' ERR
+for dependency in sbx jq; do
+    command -v "$dependency" >/dev/null 2>&1 || die "Required command not found: $dependency"
+done
+load_config
+apply_defaults
+validate_settings
+
+attach_mode=rw
+[[ -z $attach_ro ]] || attach_mode=ro
+attach_lifetime=always
+[[ -z $attach_once ]] || attach_lifetime=once
+if [[ $subcommand == detach ]]; then
+    resolve_path=resolve_detach_folder
+else
+    resolve_path=resolve_folder
+fi
+resolved_paths=()
+for host in ${attach_paths[@]+"${attach_paths[@]}"}; do
+    "$resolve_path" "$host"
+    resolved_paths+=("$resolved_folder")
+done
+if [[ ${#resolved_paths[@]} -gt 0 ]]; then
+    attach_paths=("${resolved_paths[@]}")
+fi
+
+inventory=$(sbx ls --json)
+if ! jq -e '
+    type == "array" and all(.[];
+        (.name | type == "string") and
+        (.agent | type == "string") and
+        ((.workspaces // []) | type == "array" and all(.[]; type == "string"))
+    )
+' <<<"$inventory" >/dev/null; then
+    die "Unexpected sbx ls --json format; expected the sbx 0.48+ sandbox array."
+fi
+workspace=$(pwd -P)
+
+if [[ $subcommand == ls ]]; then
+    names=()
+    agents=()
+    folders=()
+    while IFS=$'\t' read -r sandbox_name sandbox_agent sandbox_folders; do
+        if ((${#sandbox_folders} > 50)); then
+            sandbox_folders="...${sandbox_folders: -47}"
+        fi
+        names+=("$sandbox_name")
+        agents+=("$sandbox_agent")
+        folders+=("$sandbox_folders")
+    done < <(jq -r '.[] | [.name, .agent, ((.workspaces // []) | if length == 0 then "(no folder)" else join(", ") end)] | @tsv' <<<"$inventory")
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        printf 'No sandboxes yet. Create one with: sbxw opencode NAME\n'
+        exit 0
+    fi
+    if [[ ! -t 0 || ! -t 2 ]]; then
+        printf '%-24s %-10s %s\n' NAME AGENT FOLDER
+        for ((i = 0; i < ${#names[@]}; i++)); do
+            printf '%-24s %-10s %s\n' "${names[i]}" "${agents[i]}" "${folders[i]}"
+        done
+        exit 0
+    fi
+
+    trap 'printf "\033[?25h" >&2; exit 130' INT
+    if ! choose_sandbox; then
+        trap - INT
+        printf 'Cancelled.\n' >&2
+        exit 0
+    fi
+    trap - INT
+    agent=${agents[chosen]}
+    name=${names[chosen]}
+elif [[ $subcommand == attach || $subcommand == detach || $subcommand == folders ]]; then
+    find_sandbox "$name"
+    [[ -n $found ]] || die "No sandbox named '$name'. Run sbxw ls to see sandboxes."
+    name=$found
+    primary=$(primary_folder "$name")
+    read_record "$name"
+    case $subcommand in
+        attach)
+            for host in ${attach_paths[@]+"${attach_paths[@]}"}; do
+                attach_folder "$name" "$host" "$attach_mode" always
+            done
+            ;;
+        detach)
+            for host in ${attach_paths[@]+"${attach_paths[@]}"}; do
+                detach_folder "$name" "$host"
+            done
+            ;;
+        folders) show_folders ;;
+    esac
+    exit 0
+elif [[ -n $name ]]; then
+    find_sandbox "$name"
+    if [[ -n $found ]]; then
+        name=$found
+        existing_agent=$(jq -r --arg name "$name" \
+            'first(.[] | select(.name == $name) | .agent)' <<<"$inventory")
+        [[ $existing_agent == "$agent" ]] ||
+            die "'$name' uses $existing_agent, not $agent. Run: sbxw $existing_agent $name"
+        primary=$(primary_folder "$name")
+        if [[ -t 0 && -t 2 && ${#attach_paths[@]} -eq 0 ]]; then
+            offer_folder=1
+        fi
+    else
+        name=$(normalize_name "$name")
+        valid_name "$name" || die "Use at least two letters or numbers; 'default' is reserved."
+        create_sandbox
+    fi
+else
+    prompt_for_name
+    create_sandbox
+fi
+
+launch_name=$name
+agent_status=0
+trap release_once_folders EXIT
+trap 'exit 130' INT TERM HUP
+launch_sandbox "$agent" "$name" "$@"
+exit "$agent_status"

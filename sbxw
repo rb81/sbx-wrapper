@@ -463,23 +463,15 @@ launch_sandbox() {
                 exit 1
             fi
         '
-        sbx exec "$name" python3 -c '
-import json, os, sys
-home = os.environ.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"), ".copilot")
-path = os.path.join(home, "settings.json")
-os.makedirs(home, exist_ok=True)
-try:
-    with open(path) as f:
-        settings = json.load(f)
-except FileNotFoundError:
-    settings = {}
-settings["model"] = sys.argv[1]
-settings["autoTier"] = sys.argv[2]
-with open(path + ".tmp", "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-os.replace(path + ".tmp", path)
-' "$SBXW_COPILOT_MODEL" "$SBXW_COPILOT_TIER"
+        sbx exec "$name" sh -c '
+            set -eu
+            home=${COPILOT_HOME:-$HOME/.copilot}
+            file=$home/settings.json
+            mkdir -p "$home"
+            [ -f "$file" ] || printf "{}\n" > "$file"
+            jq --arg model "$1" --arg tier "$2" ".model = \$model | .autoTier = \$tier" "$file" > "$file.tmp"
+            mv "$file.tmp" "$file"
+        ' sbxw "$SBXW_COPILOT_MODEL" "$SBXW_COPILOT_TIER"
         local workdir_args=()
         [[ -n $primary ]] && workdir_args=(-w "$primary")
         sbx exec -it ${workdir_args[@]+"${workdir_args[@]}"} "$name" \

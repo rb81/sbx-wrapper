@@ -225,7 +225,7 @@ test('copilot launch updates Copilot in the sandbox before starting it', t => {
     assert.equal(f.run(['copilot', 'upd']).status, 0);
     const update = f.calls().find(c => c[0] === 'exec' && c[2] === 'sh' && c[3] === '-c' && /copilot update/.test(c[4]));
     assert.ok(update, 'update call');
-    assert.ok(f.calls().indexOf(update) < f.calls().findIndex(c => c[0] === 'exec' && c[2] === 'python3'));
+    assert.ok(f.calls().indexOf(update) < f.calls().findIndex(c => c[0] === 'exec' && c[2] === 'sh' && /jq/.test(c[4])));
     assert.equal(f.agentRuns().length, 1);
 });
 
@@ -319,7 +319,7 @@ test('copilot launch writes Copilot defaults to settings.json without calling co
     });
     assert.equal(f.run(['copilot', 'Assistant']).status, 0);
     assert.ok(!f.calls().some(c => c[0] === 'exec' && c[2] === 'copilot'));
-    assert.equal(f.calls().filter(c => c[0] === 'exec' && c[2] === 'python3').length, 1);
+    assert.equal(f.calls().filter(c => c[0] === 'exec' && c[2] === 'sh' && /jq/.test(c[4])).length, 1);
     assert.deepEqual(JSON.parse(fs.readFileSync(f.copilotSettings, 'utf8')), {
         model: 'auto', autoTier: 'balance', theme: 'keep',
     });
@@ -344,7 +344,7 @@ test('copilot launch aborts without touching settings.json when it cannot be par
     });
     const result = f.run(['copilot', 'cp']);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /JSONDecodeError|Expecting/);
+    assert.match(result.stderr, /parse error/);
     assert.ok(!f.calls().some(c => c[0] === 'run'));
     assert.equal(fs.readFileSync(f.copilotSettings, 'utf8'), original);
 });

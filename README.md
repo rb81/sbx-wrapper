@@ -179,7 +179,7 @@ SBXW_COPILOT_TIER=balance
   `--sync-session`, because sync cannot be turned off without it.
 - Before launching Copilot, the wrapper sets `model` and `autoTier` in the
   sandbox's `~/.copilot/settings.json` (or `$COPILOT_HOME/settings.json`) with
-  `python3` inside the sandbox. This saves **Auto Balance** as the default for
+  `jq` inside the sandbox. This saves **Auto Balance** as the default for
   new conversations while preserving unrelated settings. A missing file is
   created. A file that cannot be parsed (for example, one with comments) aborts
   the launch and is left unchanged. Repository settings, explicit agent
